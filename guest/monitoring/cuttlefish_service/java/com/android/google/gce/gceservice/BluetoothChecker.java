@@ -41,7 +41,7 @@ public class BluetoothChecker extends JobBase {
     public BluetoothChecker(Context context) {
         super(LOG_TAG);
         PackageManager pm = context.getPackageManager();
-        boolean hasBluetooth = pm.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH);
+        boolean hasBluetooth = false;
         if (!hasBluetooth) {
             Log.i(LOG_TAG, "Bluetooth checker disabled (feature missing)");
             mEnabled.set(false);
