@@ -180,7 +180,7 @@ Result<bool> DiskBuilder::WillRebuildCompositeDisk() {
     return true;
   } else if (last_component_mod_time > composite_mod_time) {
     LOG(DEBUG) << "Composite disk component file updated";
-    return true;
+    LOG(DEBUG) << "You may want to set -resume=n if you encounter problems";
   }
 
   return false;
