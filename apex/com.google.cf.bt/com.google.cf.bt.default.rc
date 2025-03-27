@@ -25,3 +25,4 @@ service bt_socket /apex/com.google.cf.bt/bin/hw/android.hardware.bluetooth.socke
     class hal
     user bluetooth
     group bluetooth
+    disabled
