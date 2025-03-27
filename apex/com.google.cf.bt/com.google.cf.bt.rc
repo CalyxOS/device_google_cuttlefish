@@ -35,3 +35,4 @@ service bt_socket /apex/com.google.cf.bt/bin/hw/android.hardware.bluetooth.socke
     user bluetooth
     group bluetooth net_admin net_bt_admin
     capabilities NET_ADMIN
+    disabled
