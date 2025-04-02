@@ -33,6 +33,24 @@
       "message": "I did an rsync of $OUT/*.img to the cvd directory, and this got me my updated Chromium as expected, without wiping data.",
       "revId": "caa1e45b3daf7b1d4ce3981bb1e6f6ad6335f919",
       "serverId": "35266860-6252-469c-a67d-185064479fc0"
+    },
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "87a0b0a8_0ce04cdb",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000062
+      },
+      "writtenOn": "2025-04-02T19:10:21Z",
+      "side": 1,
+      "message": "Done",
+      "parentUuid": "569c99f2_2399ad8f",
+      "revId": "caa1e45b3daf7b1d4ce3981bb1e6f6ad6335f919",
+      "serverId": "35266860-6252-469c-a67d-185064479fc0"
     }
   ]
 }
