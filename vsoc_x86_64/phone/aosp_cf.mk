@@ -64,9 +64,10 @@ PRODUCT_VENDOR_PROPERTIES += \
 
 # Ignore all Android.mk files
 PRODUCT_IGNORE_ALL_ANDROIDMK := true
-# Allow the following Android.mk files
-PRODUCT_ALLOWED_ANDROIDMK_FILES := bootable/recovery/Android.mk
-PRODUCT_ANDROIDMK_ALLOWLIST_FILE := vendor/google/build/androidmk/aosp_cf_allowlist.mk
+# TODO(b/342327756, b/342330305): Allow the following Android.mk files
+PRODUCT_ALLOWED_ANDROIDMK_FILES := art/Android.mk
+
+PRODUCT_USE_SOONG_NOTICE_XML := true
 
 # Compare target product name directly to avoid this from any product inherits aosp_cf.mk
 ifneq ($(filter aosp_cf_x86_64_phone aosp_cf_x86_64_phone_soong_system aosp_cf_x86_64_foldable,$(TARGET_PRODUCT)),)
@@ -75,6 +76,17 @@ ifneq ($(CLANG_COVERAGE),true)
 ifneq ($(NATIVE_COVERAGE),true)
 USE_SOONG_DEFINED_SYSTEM_IMAGE := true
 PRODUCT_SOONG_DEFINED_SYSTEM_IMAGE := aosp_shared_system_image
+
+# For a gradual rollout, we're starting with just enabling this for aosp_cf_x86_64_phone and
+# not any of the other products that inherit from it.
+ifeq ($(TARGET_PRODUCT),aosp_cf_x86_64_phone)
+ifeq (,$(TARGET_BUILD_APPS))
+ifeq (,$(UNBUNDLED_BUILD))
+PRODUCT_SOONG_ONLY := $(RELEASE_SOONG_ONLY_CUTTLEFISH)
+endif
+endif
+endif
+
 endif # NATIVE_COVERAGE
 endif # CLANG_COVERAGE
 endif # aosp_cf_x86_64_phone aosp_cf_x86_64_foldable

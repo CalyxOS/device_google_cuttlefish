@@ -31,7 +31,6 @@
         </h3>
       </div>
       <section id="device-connection">
-        <audio id="device-audio"></audio>
         <div id='controls-and-displays'>
           <div id='control-panel-default-buttons' class='control-panel-column'>
             <button id='power_btn' title='Power' disabled='true' class='material-icons'>power_settings_new</button>
@@ -42,6 +41,7 @@
             <button id='home_btn' title='Home' disabled='true' class='material-icons'>home</button>
             <button id='menu_btn' title='Menu' disabled='true' class='material-icons'>menu</button>
             <button id='mouse_btn' title='Mouse' disabled='true' style="display:none" class='material-icons'>mouse</button>
+            <button id='keyboard-modal-button' title='keyboard console' class='material-icons'>keyboard</button>
             <button id='touchpad-modal-button' title='Touchpads' class='material-icons'>touch_app</button>
             <button id='rotate_left_btn' title='Rotate left' disabled='true' class='material-icons' data-adb="true">rotate_90_degrees_ccw</button>
             <button id='rotate_right_btn' title='Rotate right' disabled='true' class='material-icons' data-adb="true">rotate_90_degrees_cw</button>
@@ -61,7 +61,10 @@
             <div id='device-displays' tabindex="-1">
             </div>
           </div>
+          <button id='display-add-modal-button' title='Add display' class='material-icons'>add_to_queue</button>
         </div>
+        <!-- Audio tags of id with a prefix of "device-audio" will be inserted here dynamically
+        based on the number of audio streams.-->
       </section>
       <div id='device-details-modal' class='modal'>
         <div id='device-details-modal-header' class='modal-header'>
@@ -99,15 +102,6 @@
             <div class='bluetooth-drop-down'>
               <select id='bluetooth-wizard-type' validate-mac="true" required>
                 <option value="beacon">Beacon</option>
-                <option value="beacon_swarm">Beacon Swarm</option>
-                <!-- Disabled because they were "started but never finished" (according to mylesgw@)
-                <option value="car_kit">Car Kit</option>
-                <option value="classic">Classic</option> -->
-                <option value="keyboard">Keyboard</option>
-                <option value="remote_loopback">Remote Loopback</option>
-                <option value="scripted_beacon">Scripted Beacon</option>
-                <!-- Disabled because it will never show up in the UI
-                <option value="sniffer">Sniffer</option> -->
               </select>
             </div>
             <div class='bluetooth-text-field'><input type="text" id='bluetooth-wizard-mac' placeholder="Device MAC" validate-mac="true" required></input><span></span></div>
@@ -201,6 +195,30 @@
               </div>
 
       </div>
+      <div id='keyboard-modal' class='modal-wrapper'>
+
+        <!-- keyboard-prompt-modal modal -->
+        <div id='keyboard-prompt-modal' class='modal'>
+          <div id='keyboard-prompt-modal-header' class='modal-header'>
+            <h2>Keyboard</h2>
+            <button id='keyboard-prompt-modal-close' title='Close' class='material-icons modal-close'>close</button>
+          </div>
+          <div>
+            <div id='keyboard-prompt-text' class='keyboard-text'>
+              <div class='function-key-button'>
+                <button id='shift-button' title='Shift' class='modal-button'>Shift</button>
+                <button id='alt-button' title='Alt' class='modal-button'>Alt</button>
+                <button id='ctrl-button' title='Ctrl' class='modal-button'>Ctrl</button>
+                <button id='super-button' title='Super' class='modal-button'>Super</button>
+              </div>
+              <hr>
+              <div class='keyboard-button'>
+                <button id='tab-button' title='Tab' class='modal-button'>Tab</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
       <div id='rotation-modal' class='modal'>
         <div id='rotation-modal-header' class='modal-header'>
             <h2>Rotation sensors</h2>
@@ -256,8 +274,27 @@
           <div class='touchpads'></div>
         </span>
       </div>
+      <div id='display-add-modal' class='modal'>
+        <div id='display-add-modal-header' class='modal-header'>
+          <h2>Add display</h2>
+          <button id='display-add-modal-close' title='Close' class='material-icons modal-close'>close</button>
+        </div>
+        <div>
+          <select id='display-spec-preset-select'>
+            <!-- setupDisplaySpecPresetSelector adds its options -->
+          </select>
+          <div class='display-spec-form'>
+            <label class='display-spec-label'>width<input type=number min=1 id='display-spec-width' required/></label>
+            <label class='display-spec-label'>height<input type=number min=1 id='display-spec-height' required/></label>
+            <label class='display-spec-label'>dpi<input type=number min=1 id='display-spec-dpi' required/></label>
+            <label class='display-spec-label'>refresh_rate_hz<input type=number min=1 id='display-spec-refresh-rate-hz' required/></label>
+          </div>
+          <button id='display-add-confirm' title='Add a new display' class='modal-button'>Add</button>
+        </div>
+      </div>
       <script src="js/adb.js"></script>
       <script src="js/location.js"></script>
+      <script src="js/keyboard.js"></script>
       <script src="js/rootcanal.js"></script>
       <script src="js/cf_webrtc.js" type="module"></script>
       <script src="js/controls.js"></script>
@@ -266,9 +303,12 @@
       <script src="js/app.js"></script>
       <template id="display-template">
         <div class="device-display">
-          <div class="device-display-info"></div>
+          <div class="device-display-info">
+            <div class="device-display-info-text"></div>
+            <button class="material-icons device-display-remove-button" title="Remove display">delete</button>
+          </div>
           <div class="device-video-container">
-            <video autoplay muted class="device-display-video"></video>
+            <video autoplay muted playsinline src="/" class="device-display-video"></video>
           </div>
         </div>
       </template>

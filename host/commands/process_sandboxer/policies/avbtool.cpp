@@ -16,16 +16,22 @@
 
 #include "host/commands/process_sandboxer/policies.h"
 
+#include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <syscall.h>
+#include <unistd.h>
+
+#include <string>
 
 #include <absl/log/check.h>
 #include <sandboxed_api/sandbox2/policybuilder.h>
 #include <sandboxed_api/sandbox2/util/bpf_helper.h>
-
-#include "host/commands/process_sandboxer/filesystem.h"
+#include <sandboxed_api/util/path.h>
 
 namespace cuttlefish::process_sandboxer {
+
+using sapi::file::JoinPath;
 
 /*
  * This executable is built as a `python_binary_host`:
@@ -84,6 +90,7 @@ sandbox2::PolicyBuilder AvbToolPolicy(const HostInfo& host) {
       .AllowPipe()
       .AllowSafeFcntl()
       .AllowSyscall(__NR_connect)
+      .AllowSyscall(__NR_mremap)
       .AllowSyscall(__NR_execve)
       .AllowSyscall(__NR_ftruncate)
       .AllowSyscall(__NR_recvmsg)

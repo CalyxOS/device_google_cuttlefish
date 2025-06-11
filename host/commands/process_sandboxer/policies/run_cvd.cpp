@@ -15,26 +15,40 @@
  */
 #include "host/commands/process_sandboxer/policies.h"
 
+#include <linux/bpf_common.h>
+#include <linux/filter.h>
+#include <linux/prctl.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <syscall.h>
+#include <unistd.h>
+
+#include <cstdint>
+#include <string>
+#include <vector>
 
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_replace.h>
 #include <sandboxed_api/sandbox2/policybuilder.h>
 #include <sandboxed_api/sandbox2/util/bpf_helper.h>
+#include <sandboxed_api/util/path.h>
 
 namespace cuttlefish::process_sandboxer {
+
+using sapi::file::JoinPath;
 
 sandbox2::PolicyBuilder RunCvdPolicy(const HostInfo& host) {
   std::string sandboxer_proxy = host.HostToolExe("sandboxer_proxy");
   return BaselinePolicy(host, host.HostToolExe("run_cvd"))
       .AddDirectory(host.runtime_dir, /* is_ro= */ false)
+      .AddDirectory(
+          JoinPath(host.host_artifacts_path, "etc", "default_input_devices"))
       .AddFile(host.cuttlefish_config_path)
+      .AddFile("/dev/null", /* is_ro= */ false)
       .AddFileAt(sandboxer_proxy, host.HostToolExe("adb_connector"))
       .AddFileAt(sandboxer_proxy, host.HostToolExe("casimir_control_server"))
+      .AddFileAt(sandboxer_proxy, host.HostToolExe("cf_vhost_user_input"))
       .AddFileAt(sandboxer_proxy, host.HostToolExe("control_env_proxy_server"))
       .AddFileAt(sandboxer_proxy, host.HostToolExe("crosvm"))
       .AddFileAt(sandboxer_proxy, host.HostToolExe("echo_server"))
@@ -58,18 +72,18 @@ sandbox2::PolicyBuilder RunCvdPolicy(const HostInfo& host) {
       .AddFileAt(sandboxer_proxy, host.HostToolExe("wmediumd"))
       .AddFileAt(sandboxer_proxy, host.HostToolExe("wmediumd_gen_config"))
       .AddDirectory(host.environments_dir)
-      .AddDirectory(host.environments_uds_dir, /* is_ro= */ false)
-      .AddDirectory(host.instance_uds_dir, /* is_ro= */ false)
-      .AddDirectory(host.vsock_device_dir, /* is_ro= */ false)
+      .AddDirectory(host.EnvironmentsUdsDir(), /* is_ro= */ false)
+      .AddDirectory(host.InstanceUdsDir(), /* is_ro= */ false)
+      .AddDirectory(host.VsockDeviceDir(), /* is_ro= */ false)
       // The UID inside the sandbox2 namespaces is always 1000.
-      .AddDirectoryAt(host.environments_uds_dir,
+      .AddDirectoryAt(host.EnvironmentsUdsDir(),
                       absl::StrReplaceAll(
-                          host.environments_uds_dir,
+                          host.EnvironmentsUdsDir(),
                           {{absl::StrCat("cf_env_", getuid()), "cf_env_1000"}}),
                       false)
-      .AddDirectoryAt(host.instance_uds_dir,
+      .AddDirectoryAt(host.InstanceUdsDir(),
                       absl::StrReplaceAll(
-                          host.instance_uds_dir,
+                          host.InstanceUdsDir(),
                           {{absl::StrCat("cf_avd_", getuid()), "cf_avd_1000"}}),
                       false)
       .AddPolicyOnSyscall(__NR_madvise,
@@ -129,6 +143,7 @@ sandbox2::PolicyBuilder RunCvdPolicy(const HostInfo& host) {
       .AllowSyscall(__NR_recvmsg)
       .AllowSyscall(__NR_sendmsg)
       .AllowSyscall(__NR_setpgid)
+      .AllowSyscall(__NR_shutdown)
       .AllowSyscall(__NR_socketpair)
       .AllowSyscall(__NR_waitid)  // Not covered by `AllowWait()`
       .AllowTCGETS()

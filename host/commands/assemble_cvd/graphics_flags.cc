@@ -45,6 +45,7 @@ enum class RenderingMode {
   kGfxstream,
   kGfxstreamGuestAngle,
   kGfxstreamGuestAngleHostSwiftshader,
+  kGfxstreamGuestAngleHostLavapipe,
   kVirglRenderer,
 };
 
@@ -61,6 +62,9 @@ Result<RenderingMode> GetRenderingMode(const std::string& mode) {
   }
   if (mode == std::string(kGpuModeGfxstreamGuestAngleHostSwiftShader)) {
     return RenderingMode::kGfxstreamGuestAngleHostSwiftshader;
+  }
+  if (mode == std::string(kGpuModeGfxstreamGuestAngleHostLavapipe)) {
+    return RenderingMode::kGfxstreamGuestAngleHostLavapipe;
   }
   if (mode == std::string(kGpuModeGuestSwiftshader)) {
     return RenderingMode::kGuestSwiftShader;
@@ -261,6 +265,7 @@ Result<std::string> SelectGpuMode(
       gpu_mode_arg != kGpuModeCustom && gpu_mode_arg != kGpuModeGfxstream &&
       gpu_mode_arg != kGpuModeGfxstreamGuestAngle &&
       gpu_mode_arg != kGpuModeGfxstreamGuestAngleHostSwiftShader &&
+      gpu_mode_arg != kGpuModeGfxstreamGuestAngleHostLavapipe &&
       gpu_mode_arg != kGpuModeGuestSwiftshader &&
       gpu_mode_arg != kGpuModeNone) {
     return CF_ERR("Invalid gpu_mode: " << gpu_mode_arg);
@@ -359,6 +364,30 @@ Result<bool> SelectGpuVhostUserMode(const std::string& gpu_mode,
   }
 
   return gpu_vhost_user_mode_arg == kGpuVhostUserModeOn;
+}
+
+Result<GuestRendererPreload> SelectGuestRendererPreload(
+    const std::string& gpu_mode, const GuestHwuiRenderer guest_hwui_renderer,
+    const std::string& guest_renderer_preload_arg) {
+  GuestRendererPreload guest_renderer_preload =
+      GuestRendererPreload::kGuestDefault;
+
+  if (!guest_renderer_preload_arg.empty()) {
+    guest_renderer_preload =
+        CF_EXPECT(ParseGuestRendererPreload(guest_renderer_preload_arg));
+  }
+
+  if (guest_renderer_preload == GuestRendererPreload::kAuto) {
+    if (guest_hwui_renderer == GuestHwuiRenderer::kSkiaVk &&
+        (gpu_mode == kGpuModeGfxstreamGuestAngle ||
+         gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader)) {
+      LOG(INFO) << "Disabling guest renderer preload for Gfxstream based mode "
+                   "when running with SkiaVk.";
+      guest_renderer_preload = GuestRendererPreload::kDisabled;
+    }
+  }
+
+  return guest_renderer_preload;
 }
 
 #endif
@@ -559,7 +588,9 @@ Result<std::string> ConfigureGpuSettings(
     const gfxstream::proto::GraphicsAvailability& graphics_availability,
     const std::string& gpu_mode_arg, const std::string& gpu_vhost_user_mode_arg,
     const std::string& gpu_renderer_features_arg,
-    std::string& gpu_context_types_arg, VmmMode vmm,
+    std::string& gpu_context_types_arg,
+    const std::string& guest_hwui_renderer_arg,
+    const std::string& guest_renderer_preload_arg, VmmMode vmm,
     const GuestConfig& guest_config,
     CuttlefishConfig::MutableInstanceSpecific& instance) {
 #ifdef __APPLE__
@@ -584,7 +615,8 @@ Result<std::string> ConfigureGpuSettings(
 
   if (gpu_mode == kGpuModeGfxstream ||
       gpu_mode == kGpuModeGfxstreamGuestAngle ||
-      gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader) {
+      gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+      gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
     CF_EXPECT(SetGfxstreamFlags(gpu_mode, gpu_renderer_features_arg,
                                 guest_config, graphics_availability, instance));
   }
@@ -616,8 +648,21 @@ Result<std::string> ConfigureGpuSettings(
     instance.set_enable_gpu_system_blob(false);
   }
 
+  GuestHwuiRenderer hwui_renderer = GuestHwuiRenderer::kUnknown;
+  if (!guest_hwui_renderer_arg.empty()) {
+    hwui_renderer = CF_EXPECT(
+        ParseGuestHwuiRenderer(guest_hwui_renderer_arg),
+        "Failed to parse HWUI renderer flag: " << guest_hwui_renderer_arg);
+  }
+  instance.set_guest_hwui_renderer(hwui_renderer);
+
+  const auto guest_renderer_preload = CF_EXPECT(SelectGuestRendererPreload(
+      gpu_mode, hwui_renderer, guest_renderer_preload_arg));
+  instance.set_guest_renderer_preload(guest_renderer_preload);
+
   instance.set_gpu_mode(gpu_mode);
   instance.set_enable_gpu_vhost_user(enable_gpu_vhost_user);
+
 #endif
 
   return gpu_mode;

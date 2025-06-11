@@ -16,21 +16,26 @@
 
 #include "host/commands/process_sandboxer/policies.h"
 
+#include <linux/filter.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <syscall.h>
 
+#include <cerrno>
+#include <vector>
+
 #include <sandboxed_api/sandbox2/policybuilder.h>
 #include <sandboxed_api/sandbox2/util/bpf_helper.h>
-
-#include "host/commands/process_sandboxer/filesystem.h"
+#include <sandboxed_api/util/path.h>
 
 namespace cuttlefish::process_sandboxer {
 
+using sapi::file::JoinPath;
+
 sandbox2::PolicyBuilder WmediumdPolicy(const HostInfo& host) {
   return BaselinePolicy(host, host.HostToolExe("wmediumd"))
-      .AddDirectory(host.environments_uds_dir, /* is_ro= */ false)
-      .AddDirectory(host.instance_uds_dir, /* is_ro= */ false)
+      .AddDirectory(host.EnvironmentsUdsDir(), /* is_ro= */ false)
+      .AddDirectory(host.InstanceUdsDir(), /* is_ro= */ false)
       .AddDirectory(host.log_dir, /* is_ro= */ false)
       .AddFile("/dev/urandom")  // For gRPC
       .AddFile(JoinPath(host.environments_dir, "env-1", "wmediumd.cfg"),
@@ -40,10 +45,10 @@ sandbox2::PolicyBuilder WmediumdPolicy(const HostInfo& host) {
       .AddPolicyOnMmap([](bpf_labels& labels) -> std::vector<sock_filter> {
         return {
             ARG_32(2),  // prot
-            JNE32(PROT_READ | PROT_WRITE, JUMP(&labels, cf_webrtc_mmap_end)),
+            JNE32(PROT_READ | PROT_WRITE, JUMP(&labels, cf_wmediumd_mmap_end)),
             ARG_32(3),  // flags
             JEQ32(MAP_SHARED, ALLOW),
-            LABEL(&labels, cf_webrtc_mmap_end),
+            LABEL(&labels, cf_wmediumd_mmap_end),
         };
       })
       .AddPolicyOnSyscalls(
@@ -51,11 +56,10 @@ sandbox2::PolicyBuilder WmediumdPolicy(const HostInfo& host) {
           [](bpf_labels& labels) -> std::vector<sock_filter> {
             return {
                 ARG_32(1),  // level
-                JNE32(SOL_SOCKET,
-                      JUMP(&labels, cf_screen_recording_server_getsockopt_end)),
+                JNE32(SOL_SOCKET, JUMP(&labels, cf_wmediumd_getsockopt_end)),
                 ARG_32(2),  // optname
                 JEQ32(SO_REUSEPORT, ALLOW),
-                LABEL(&labels, cf_screen_recording_server_getsockopt_end),
+                LABEL(&labels, cf_wmediumd_getsockopt_end),
             };
           })
       .AddPolicyOnSyscall(__NR_madvise,

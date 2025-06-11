@@ -91,6 +91,10 @@ class OpenWrt : public CommandSource {
         instance_.PerInstanceInternalUdsPath(crosvm_for_ap_socket),
         instance_.crosvm_binary());
 
+    if (!config_.kvm_path().empty()) {
+      ap_cmd.AddKvmPath(config_.kvm_path());
+    }
+
     ap_cmd.Cmd().AddParameter("--no-usb");
     ap_cmd.Cmd().AddParameter("--core-scheduling=false");
 
@@ -98,7 +102,7 @@ class OpenWrt : public CommandSource {
       ap_cmd.Cmd().AddParameter("--vhost-user=mac80211-hwsim,socket=",
                                 environment_.vhost_user_mac80211_hwsim());
     }
-    if (environment_.enable_wifi()) {
+    if (environment_.enable_wifi() && instance_.enable_tap_devices()) {
       ap_cmd.AddTap(instance_.wifi_tap_name());
     }
 
@@ -157,7 +161,7 @@ class OpenWrt : public CommandSource {
 
     std::vector<MonitorCommand> commands;
     commands.emplace_back(
-        CF_EXPECT(log_tee_.CreateLogTee(ap_cmd.Cmd(), "openwrt")));
+        CF_EXPECT(log_tee_.CreateFullLogTee(ap_cmd.Cmd(), "openwrt")));
     commands.emplace_back(std::move(ap_cmd.Cmd()));
     return commands;
   }

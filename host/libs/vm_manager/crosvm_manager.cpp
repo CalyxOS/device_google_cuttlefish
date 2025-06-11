@@ -34,9 +34,10 @@
 #include <json/json.h>
 #include <vulkan/vulkan.h>
 
-#include "common/libs/utils/environment.h"
+#include "common/libs/utils/architecture.h"
 #include "common/libs/utils/files.h"
 #include "common/libs/utils/json.h"
+#include "common/libs/utils/known_paths.h"
 #include "common/libs/utils/network.h"
 #include "common/libs/utils/result.h"
 #include "common/libs/utils/subprocess.h"
@@ -98,10 +99,12 @@ CrosvmManager::ConfigureGraphics(
   } else if (instance.gpu_mode() == kGpuModeGfxstream ||
              instance.gpu_mode() == kGpuModeGfxstreamGuestAngle ||
              instance.gpu_mode() ==
-                 kGpuModeGfxstreamGuestAngleHostSwiftShader) {
+                 kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+             instance.gpu_mode() == kGpuModeGfxstreamGuestAngleHostLavapipe) {
     const bool uses_angle =
         instance.gpu_mode() == kGpuModeGfxstreamGuestAngle ||
-        instance.gpu_mode() == kGpuModeGfxstreamGuestAngleHostSwiftShader;
+        instance.gpu_mode() == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+        instance.gpu_mode() == kGpuModeGfxstreamGuestAngleHostLavapipe;
 
     const std::string gles_impl = uses_angle ? "angle" : "emulation";
 
@@ -140,6 +143,20 @@ CrosvmManager::ConfigureGraphics(
     return {};
   } else {
     return CF_ERR("Unknown GPU mode " << instance.gpu_mode());
+  }
+
+  if (auto r = instance.guest_hwui_renderer();
+      r != GuestHwuiRenderer::kUnknown) {
+    bootconfig_args["androidboot.hardware.guest_hwui_renderer"] = ToString(r);
+  }
+
+  const auto guest_renderer_preload = instance.guest_renderer_preload();
+  if (guest_renderer_preload == GuestRendererPreload::kEnabled) {
+    bootconfig_args["androidboot.hardware.guest_disable_renderer_preload"] =
+        "false";
+  } else if (guest_renderer_preload == GuestRendererPreload::kDisabled) {
+    bootconfig_args["androidboot.hardware.guest_disable_renderer_preload"] =
+        "true";
   }
 
   if (!instance.gpu_angle_feature_overrides_enabled().empty()) {
@@ -198,6 +215,18 @@ Result<std::string> HostSwiftShaderIcdPathForArch() {
                                        << " for finding SwiftShader ICD.");
 }
 
+Result<std::string> HostLavapipeIcdPathForArch() {
+  switch (HostArch()) {
+    case Arch::X86:
+    case Arch::X86_64:
+      return HostUsrSharePath("vulkan/icd.d/vk_lavapipe_icd.cf.json");
+    default:
+      break;
+  }
+  return CF_ERR("Unhandled host arch " << HostArchStr()
+                                       << " for finding SwiftShader ICD.");
+}
+
 Result<void> MaybeConfigureVulkanIcd(const CuttlefishConfig& config,
                                      Command* command) {
   const auto& gpu_mode = config.ForDefaultInstance().gpu_mode();
@@ -210,6 +239,39 @@ Result<void> MaybeConfigureVulkanIcd(const CuttlefishConfig& config,
                                     swiftshader_icd_json_path);
     command->AddEnvironmentVariable("VK_ICD_FILENAMES",
                                     swiftshader_icd_json_path);
+  } else if (gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
+    const std::string lavapipe_icd_json_path =
+        CF_EXPECT(HostLavapipeIcdPathForArch());
+
+    // See https://github.com/KhronosGroup/Vulkan-Loader.
+    command->AddEnvironmentVariable("VK_DRIVER_FILES", lavapipe_icd_json_path);
+    command->AddEnvironmentVariable("VK_ICD_FILENAMES", lavapipe_icd_json_path);
+  }
+
+  return {};
+}
+
+// b/277618912: glibc's aarch64 memcpy uses unaligned accesses which seems to
+// cause SIGBUS errors on some Nvidia GPUs.
+Result<void> MaybeConfigureMemOverridesLibrary(const CuttlefishConfig& config,
+                                               Command* command) {
+  const auto& gpu_mode = config.ForDefaultInstance().gpu_mode();
+  const bool is_gpu_mode_accelerated =
+      (gpu_mode == kGpuModeDrmVirgl || gpu_mode == kGpuModeGfxstream ||
+       gpu_mode == kGpuModeGfxstreamGuestAngle);
+
+  const bool is_arm64 = HostArch() == Arch::Arm64;
+
+  if (is_gpu_mode_accelerated && is_arm64) {
+    LOG(INFO)
+        << "Enabling libmem_overrides.so preload to work around b/277618912.";
+
+    const std::string mem_override_lib_path =
+        HostBinaryPath("aarch64-linux-gnu/libmem_overrides.so");
+    CF_EXPECT(FileExists(mem_override_lib_path),
+              "Failed to find " << mem_override_lib_path);
+
+    command->AddEnvironmentVariable("LD_PRELOAD", mem_override_lib_path);
   }
 
   return {};
@@ -271,7 +333,8 @@ Result<VhostUserDeviceCommands> BuildVhostUserGpu(
   CF_EXPECT(
       gpu_mode == kGpuModeGfxstream ||
           gpu_mode == kGpuModeGfxstreamGuestAngle ||
-          gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader,
+          gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+          gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe,
       "GPU mode " << gpu_mode << " not yet supported with vhost user gpu.");
 
   const std::string gpu_pci_address =
@@ -285,7 +348,8 @@ Result<VhostUserDeviceCommands> BuildVhostUserGpu(
     gpu_params_json["egl"] = true;
     gpu_params_json["gles"] = true;
   } else if (gpu_mode == kGpuModeGfxstreamGuestAngle ||
-             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader) {
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
     gpu_params_json["context-types"] = "gfxstream-vulkan";
     gpu_params_json["egl"] = false;
     gpu_params_json["gles"] = false;
@@ -350,6 +414,8 @@ Result<VhostUserDeviceCommands> BuildVhostUserGpu(
   gpu_device_cmd.Cmd().AddParameter("--params");
   gpu_device_cmd.Cmd().AddParameter(ToSingleLineString(gpu_params_json));
 
+  CF_EXPECT(MaybeConfigureMemOverridesLibrary(config, &gpu_device_cmd.Cmd()));
+
   CF_EXPECT(MaybeConfigureVulkanIcd(config, &gpu_device_cmd.Cmd()));
 
   gpu_device_cmd.Cmd().RedirectStdIO(Subprocess::StdIOChannel::kStdOut,
@@ -370,7 +436,8 @@ Result<void> ConfigureGpu(const CuttlefishConfig& config, Command* crosvm_cmd) {
 
   const std::string gles_string =
       gpu_mode == kGpuModeGfxstreamGuestAngle ||
-              gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader
+              gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+              gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe
           ? ",gles=false"
           : ",gles=true";
 
@@ -412,8 +479,9 @@ Result<void> ConfigureGpu(const CuttlefishConfig& config, Command* crosvm_cmd) {
           },
           ","));
     }
-    gpu_displays_string =
-        "displays=[[" + android::base::Join(gpu_displays_strings, "],[") + "]],";
+    gpu_displays_string = "displays=[[" +
+                          android::base::Join(gpu_displays_strings, "],[") +
+                          "]],";
 
     crosvm_cmd->AddParameter("--wayland-sock=", instance.frames_socket_path());
   }
@@ -431,7 +499,8 @@ Result<void> ConfigureGpu(const CuttlefishConfig& config, Command* crosvm_cmd) {
         "context-types=gfxstream-gles:gfxstream-vulkan:gfxstream-composer",
         gpu_common_3d_string);
   } else if (gpu_mode == kGpuModeGfxstreamGuestAngle ||
-             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader) {
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
     crosvm_cmd->AddParameter(
         "--gpu=", gpu_displays_string,
         "context-types=gfxstream-vulkan:gfxstream-composer",
@@ -492,6 +561,10 @@ Result<std::vector<MonitorCommand>> CrosvmManager::StartCommands(
   crosvm_cmd.AddControlSocket(instance.CrosvmSocketPath(),
                               instance.crosvm_binary());
 
+  if (!config.kvm_path().empty()) {
+    crosvm_cmd.AddKvmPath(config.kvm_path());
+  }
+
   if (!instance.smt()) {
     crosvm_cmd.Cmd().AddParameter("--no-smt");
   }
@@ -527,6 +600,14 @@ Result<std::vector<MonitorCommand>> CrosvmManager::StartCommands(
 
   if (!instance.crosvm_use_rng()) {
     crosvm_cmd.Cmd().AddParameter("--no-rng");
+  }
+
+  if (instance.crosvm_simple_media_device()) {
+    crosvm_cmd.Cmd().AddParameter("--simple-media-device");
+  }
+
+  if (!instance.crosvm_v4l2_proxy().empty()) {
+    crosvm_cmd.Cmd().AddParameter("--v4l2-proxy=", instance.crosvm_v4l2_proxy());
   }
 
   if (instance.gdb_port() > 0) {
@@ -592,61 +673,41 @@ Result<std::vector<MonitorCommand>> CrosvmManager::StartCommands(
   }
 
   if (instance.enable_webrtc()) {
-    bool is_chromeos =
-        instance.boot_flow() ==
-            CuttlefishConfig::InstanceSpecific::BootFlow::ChromeOs ||
-        instance.boot_flow() ==
-            CuttlefishConfig::InstanceSpecific::BootFlow::ChromeOsDisk;
-    auto touch_type_parameter =
-        is_chromeos ? "single-touch" : "multi-touch";
-
     auto display_configs = instance.display_configs();
     CF_EXPECT(display_configs.size() >= 1);
 
-    int touch_idx = 0;
-    for (auto& display_config : display_configs) {
-      crosvm_cmd.Cmd().AddParameter(
-          "--input=", touch_type_parameter, "[path=",
-          instance.touch_socket_path(touch_idx++),
-          ",width=", display_config.width,
-          ",height=", display_config.height, "]");
-    }
-    auto touchpad_configs = instance.touchpad_configs();
-    for (int i = 0; i < touchpad_configs.size(); ++i) {
-      auto touchpad_config = touchpad_configs[i];
-      crosvm_cmd.Cmd().AddParameter(
-          "--input=", touch_type_parameter, "[path=",
-          instance.touch_socket_path(touch_idx++),
-          ",width=", touchpad_config.width,
-          ",height=", touchpad_config.height,
-          ",name=", kTouchpadDefaultPrefix, i, "]");
+    const int display_cnt = instance.display_configs().size();
+    const int touchpad_cnt = instance.touchpad_configs().size();
+    const int total_touch_cnt = display_cnt + touchpad_cnt;
+    for (int touch_idx = 0; touch_idx < total_touch_cnt; ++touch_idx) {
+      crosvm_cmd.AddVhostUser("input", instance.touch_socket_path(touch_idx));
     }
     if (instance.enable_mouse()) {
-      crosvm_cmd.Cmd().AddParameter(
-          "--input=mouse[path=", instance.mouse_socket_path(), "]");
+      crosvm_cmd.AddVhostUser("input", instance.mouse_socket_path());
     }
-    crosvm_cmd.Cmd().AddParameter("--input=rotary[path=",
-                                  instance.rotary_socket_path(), "]");
-    crosvm_cmd.Cmd().AddParameter("--input=keyboard[path=",
-                                  instance.keyboard_socket_path(), "]");
-    crosvm_cmd.Cmd().AddParameter("--input=switches[path=",
-                                  instance.switches_socket_path(), "]");
+    crosvm_cmd.AddVhostUser("input", instance.rotary_socket_path());
+    crosvm_cmd.AddVhostUser("input", instance.keyboard_socket_path());
+    crosvm_cmd.AddVhostUser("input", instance.switches_socket_path());
   }
 
   // GPU capture can only support named files and not file descriptors due to
   // having to pass arguments to crosvm via a wrapper script.
 #ifdef __linux__
-  if (!gpu_capture_enabled) {
+  if (instance.enable_tap_devices() && !gpu_capture_enabled) {
     // The PCI ordering of tap devices is important. Make sure any change here
     // is reflected in ethprime u-boot variable.
-    // TODO(b/218364216, b/322862402): Crosvm occupies 32 PCI devices first and only then uses PCI
-    // functions which may break order. The final solution is going to be a PCI allocation strategy
-    // that will guarantee the ordering. For now, hardcode PCI network devices to unoccupied
-    // functions.
-    const pci::Address mobile_pci = pci::Address(0, VmManager::kNetPciDeviceNum, 1);
-    const pci::Address ethernet_pci = pci::Address(0, VmManager::kNetPciDeviceNum, 2);
-    crosvm_cmd.AddTap(instance.mobile_tap_name(), instance.mobile_mac(), mobile_pci);
-    crosvm_cmd.AddTap(instance.ethernet_tap_name(), instance.ethernet_mac(), ethernet_pci);
+    // TODO(b/218364216, b/322862402): Crosvm occupies 32 PCI devices first and
+    // only then uses PCI functions which may break order. The final solution is
+    // going to be a PCI allocation strategy that will guarantee the ordering.
+    // For now, hardcode PCI network devices to unoccupied functions.
+    const pci::Address mobile_pci =
+        pci::Address(0, VmManager::kNetPciDeviceNum, 1);
+    const pci::Address ethernet_pci =
+        pci::Address(0, VmManager::kNetPciDeviceNum, 2);
+    crosvm_cmd.AddTap(instance.mobile_tap_name(), instance.mobile_mac(),
+                      mobile_pci);
+    crosvm_cmd.AddTap(instance.ethernet_tap_name(), instance.ethernet_mac(),
+                      ethernet_pci);
 
     if (!config.virtio_mac80211_hwsim() && environment.enable_wifi()) {
       crosvm_cmd.AddTap(instance.wifi_tap_name());
@@ -682,12 +743,14 @@ Result<std::vector<MonitorCommand>> CrosvmManager::StartCommands(
 
   if (instance.vsock_guest_cid() >= 2) {
     if (instance.vhost_user_vsock()) {
-      auto param =
-          fmt::format("/tmp/vsock_{}_{}/vhost.socket,max-queue-size=256",
-                      instance.vsock_guest_cid(), std::to_string(getuid()));
-      crosvm_cmd.Cmd().AddParameter("--vhost-user=vsock,socket=", param);
+      crosvm_cmd.AddVhostUser(
+          "vsock", fmt::format("{}/vsock_{}_{}/vhost.socket", TempDir(),
+                               instance.vsock_guest_cid(), getuid()));
+    } else if (config.vhost_vsock_path().empty()) {
+      crosvm_cmd.Cmd().AddParameter("--vsock=cid=", instance.vsock_guest_cid());
     } else {
-      crosvm_cmd.Cmd().AddParameter("--cid=", instance.vsock_guest_cid());
+      crosvm_cmd.Cmd().AddParameter("--vsock=cid=", instance.vsock_guest_cid(),
+                                    ",device=", config.vhost_vsock_path());
     }
   }
 
@@ -822,7 +885,6 @@ Result<std::vector<MonitorCommand>> CrosvmManager::StartCommands(
     crosvm_cmd.AddHvcSink();
   }
 
-
   // /dev/hvc13 = sensors
   crosvm_cmd.AddHvcReadWrite(
       instance.PerInstanceInternalPath("sensors_fifo_vm.out"),
@@ -842,6 +904,13 @@ Result<std::vector<MonitorCommand>> CrosvmManager::StartCommands(
     auto path = instance.PerInstanceInternalPath("mcu");
     path += "/" + instance.mcu()["uart0"]["path"].asString();
     crosvm_cmd.AddHvcReadWrite(path, path);
+  } else {
+    crosvm_cmd.AddHvcSink();
+  }
+
+  // /dev/hvc16 = Ti50 TPM FIFO
+  if (!instance.ti50_emulator().empty()) {
+    crosvm_cmd.AddHvcSocket(instance.PerInstancePath("direct_tpm_fifo"));
   } else {
     crosvm_cmd.AddHvcSink();
   }

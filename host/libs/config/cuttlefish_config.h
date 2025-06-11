@@ -28,7 +28,8 @@
 
 #include <fmt/ostream.h>
 
-#include "common/libs/utils/environment.h"
+#include "common/libs/utils/architecture.h"
+#include "common/libs/utils/device_type.h"
 #include "common/libs/utils/result.h"
 #include "host/libs/config/config_constants.h"
 #include "host/libs/config/config_fragment.h"
@@ -60,6 +61,25 @@ enum class ExternalNetworkMode {
 
 std::ostream& operator<<(std::ostream&, ExternalNetworkMode);
 Result<ExternalNetworkMode> ParseExternalNetworkMode(std::string_view);
+
+enum class GuestHwuiRenderer {
+  kUnknown,
+  kSkiaGl,
+  kSkiaVk,
+};
+std::ostream& operator<<(std::ostream&, GuestHwuiRenderer);
+std::string ToString(GuestHwuiRenderer renderer);
+Result<GuestHwuiRenderer> ParseGuestHwuiRenderer(std::string_view);
+
+enum class GuestRendererPreload {
+  kAuto,
+  kGuestDefault,
+  kEnabled,
+  kDisabled,
+};
+std::ostream& operator<<(std::ostream&, GuestRendererPreload);
+std::string ToString(GuestRendererPreload);
+Result<GuestRendererPreload> ParseGuestRendererPreload(std::string_view);
 
 // Holds the configuration of the cuttlefish instances.
 class CuttlefishConfig {
@@ -114,6 +134,7 @@ class CuttlefishConfig {
     int height;
     int dpi;
     int refresh_rate_hz;
+    std::string overlays;
   };
 
   struct TouchpadConfig {
@@ -234,6 +255,9 @@ class CuttlefishConfig {
   void set_sig_server_strict(bool strict);
   bool sig_server_strict() const;
 
+  // Whether display composition is enabled for one or more displays
+  bool OverlaysEnabled() const;
+
   void set_host_tools_version(const std::map<std::string, uint32_t>&);
   std::map<std::string, uint32_t> host_tools_version() const;
 
@@ -275,6 +299,12 @@ class CuttlefishConfig {
   std::set<std::string> straced_host_executables() const;
   void set_straced_host_executables(const std::set<std::string>& executables);
 
+  std::string kvm_path() const;
+  void set_kvm_path(const std::string&);
+
+  std::string vhost_vsock_path() const;
+  void set_vhost_vsock_path(const std::string&);
+
   bool IsCrosvm() const;
 
   class InstanceSpecific;
@@ -303,8 +333,12 @@ class CuttlefishConfig {
 
     Json::Value* Dictionary();
     const Json::Value* Dictionary() const;
-  public:
+   public:
     std::string serial_number() const;
+
+    // Index of this instance within current configured group of VMs
+    int index() const;
+
     // If any of the following port numbers is 0, the relevant service is not
     // running on the guest.
 
@@ -450,6 +484,25 @@ class CuttlefishConfig {
 
     BootFlow boot_flow() const;
 
+    enum class GuestOs { Android, ChromeOs, Linux, Fuchsia };
+
+    GuestOs guest_os() const {
+      switch (boot_flow()) {
+        case BootFlow::Android:
+        case BootFlow::AndroidEfiLoader:
+          return GuestOs::Android;
+        case BootFlow::ChromeOs:
+        case BootFlow::ChromeOsDisk:
+          return GuestOs::ChromeOs;
+        case BootFlow::Linux:
+          return GuestOs::Linux;
+        case BootFlow::Fuchsia:
+          return GuestOs::Fuchsia;
+          // Don't include a default case, this needs to fail when not all cases
+          // are covered.
+      }
+    }
+
     // modem simulator related
     std::string modem_simulator_ports() const;
 
@@ -505,6 +558,8 @@ class CuttlefishConfig {
 
     bool crosvm_use_balloon() const;
     bool crosvm_use_rng() const;
+    bool crosvm_simple_media_device() const;
+    std::string crosvm_v4l2_proxy() const;
     bool use_pmem() const;
 
     // Wifi MAC address inside the guest
@@ -540,6 +595,8 @@ class CuttlefishConfig {
     // forces.
     bool use_bootloader() const;
 
+    DeviceType device_type() const;
+
     Arch target_arch() const;
 
     int cpus() const;
@@ -566,6 +623,8 @@ class CuttlefishConfig {
     bool run_as_daemon() const;
     bool enable_audio() const;
     bool enable_mouse() const;
+    std::optional<std::string> custom_keyboard_config() const;
+    const Json::Value& domkey_mapping_config() const;
     bool enable_gnss_grpc_proxy() const;
     bool enable_bootanimation() const;
     bool enable_usb() const;
@@ -577,6 +636,7 @@ class CuttlefishConfig {
     std::string boot_slot() const;
     bool fail_fast() const;
     bool vhost_user_block() const;
+    std::string ti50_emulator() const;
 
     // Kernel and bootloader logging
     bool enable_kernel_log() const;
@@ -618,6 +678,8 @@ class CuttlefishConfig {
     std::string gpu_gfxstream_transport() const;
     std::string gpu_renderer_features() const;
     std::string gpu_context_types() const;
+    GuestHwuiRenderer guest_hwui_renderer() const;
+    GuestRendererPreload guest_renderer_preload() const;
     std::string guest_vulkan_driver() const;
     bool guest_uses_bgra_framebuffers() const;
     std::string frames_socket_path() const;
@@ -692,6 +754,10 @@ class CuttlefishConfig {
     ExternalNetworkMode external_network_mode() const;
 
     bool start_vhal_proxy_server() const;
+
+    int audio_output_streams_count() const;
+
+    bool enable_tap_devices() const;
   };
 
   // A view into an existing CuttlefishConfig object for a particular instance.
@@ -703,7 +769,7 @@ class CuttlefishConfig {
     MutableInstanceSpecific(CuttlefishConfig* config, const std::string& id);
 
     Json::Value* Dictionary();
-  public:
+   public:
     void set_serial_number(const std::string& serial_number);
     void set_qemu_vnc_server_port(int qemu_vnc_server_port);
     void set_tombstone_receiver_port(int tombstone_receiver_port);
@@ -754,6 +820,8 @@ class CuttlefishConfig {
     void set_ap_boot_flow(InstanceSpecific::APBootFlow flow);
     void set_crosvm_use_balloon(const bool use_balloon);
     void set_crosvm_use_rng(const bool use_rng);
+    void set_crosvm_simple_media_device(const bool simple_media_device);
+    void set_crosvm_v4l2_proxy(const std::string v4l2_proxy);
     void set_use_pmem(const bool use_pmem);
     // Wifi MAC address inside the guest
     void set_wifi_mac_prefix(const int wifi_mac_prefix);
@@ -770,6 +838,7 @@ class CuttlefishConfig {
     void set_enable_sandbox(const bool enable_sandbox);
     void set_enable_virtiofs(const bool enable_virtiofs);
     void set_kgdb(bool kgdb);
+    void set_device_type(DeviceType type);
     void set_target_arch(Arch target_arch);
     void set_cpus(int cpus);
     void set_vcpu_config_path(const std::string& vcpu_config_path);
@@ -789,6 +858,10 @@ class CuttlefishConfig {
     void set_run_as_daemon(bool run_as_daemon);
     void set_enable_audio(bool enable);
     void set_enable_mouse(bool enable);
+    void set_custom_keyboard_config(
+        const std::string& custom_keyboard_config_json_path);
+    void set_domkey_mapping_config(
+        const std::string& domkey_mapping_config_json_path);
     void set_enable_usb(bool enable);
     void set_enable_gnss_grpc_proxy(const bool enable_gnss_grpc_proxy);
     void set_enable_bootanimation(const bool enable_bootanimation);
@@ -801,6 +874,7 @@ class CuttlefishConfig {
     void set_grpc_socket_path(const std::string& sockets);
     void set_fail_fast(bool fail_fast);
     void set_vhost_user_block(bool qemu_vhost_user_block);
+    void set_ti50_emulator(const std::string& ti50_emulator);
 
     // Kernel and bootloader logging
     void set_enable_kernel_log(bool enable_kernel_log);
@@ -844,6 +918,8 @@ class CuttlefishConfig {
     void set_gpu_gfxstream_transport(const std::string& transport);
     void set_gpu_renderer_features(const std::string& features);
     void set_gpu_context_types(const std::string& context_types);
+    void set_guest_hwui_renderer(GuestHwuiRenderer renderer);
+    void set_guest_renderer_preload(GuestRendererPreload preload);
     void set_guest_vulkan_driver(const std::string& driver);
     void set_guest_uses_bgra_framebuffers(bool uses_bgra);
     void set_frames_socket_path(const std::string& driver);
@@ -910,6 +986,10 @@ class CuttlefishConfig {
     // connect to.
     void set_start_vhal_proxy_server(bool enable_vhal_proxy_server);
 
+    void set_audio_output_streams_count(int count);
+
+    void set_enable_tap_devices(bool);
+
    private:
     void SetPath(const std::string& key, const std::string& path);
   };
@@ -967,6 +1047,7 @@ class CuttlefishConfig {
     std::string wmediumd_api_server_socket() const;
     std::string wmediumd_config() const;
     int wmediumd_mac_prefix() const;
+    int group_uuid() const;
   };
 
   class MutableEnvironmentSpecific {
@@ -991,6 +1072,8 @@ class CuttlefishConfig {
     void set_wmediumd_api_server_socket(const std::string& path);
     void set_wmediumd_config(const std::string& path);
     void set_wmediumd_mac_prefix(int mac_prefix);
+
+    void set_group_uuid(const int group_uuid);
   };
 
  private:
@@ -1026,6 +1109,7 @@ extern const char* const kGpuModeDrmVirgl;
 extern const char* const kGpuModeGfxstream;
 extern const char* const kGpuModeGfxstreamGuestAngle;
 extern const char* const kGpuModeGfxstreamGuestAngleHostSwiftShader;
+extern const char* const kGpuModeGfxstreamGuestAngleHostLavapipe;
 extern const char* const kGpuModeGuestSwiftshader;
 extern const char* const kGpuModeNone;
 

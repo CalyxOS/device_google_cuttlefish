@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <map>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -31,8 +32,9 @@
 #include <android-base/parsedouble.h>
 #include <gflags/gflags.h>
 
-#include "common/libs/confui/confui.h"
 #include "common/libs/fs/shared_buf.h"
+#include "common/libs/utils/json.h"
+#include "common/libs/utils/result.h"
 #include "host/frontend/webrtc/adb_handler.h"
 #include "host/frontend/webrtc/bluetooth_handler.h"
 #include "host/frontend/webrtc/gpx_locations_handler.h"
@@ -40,8 +42,10 @@
 #include "host/frontend/webrtc/libdevice/camera_controller.h"
 #include "host/frontend/webrtc/libdevice/lights_observer.h"
 #include "host/frontend/webrtc/location_handler.h"
+#include "host/libs/config/config_utils.h"
 #include "host/libs/config/cuttlefish_config.h"
 #include "host/libs/input_connector/input_connector.h"
+#include "host/libs/vm_manager/crosvm_display_controller.h"
 
 namespace cuttlefish {
 
@@ -54,11 +58,11 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
  public:
   ConnectionObserverImpl(
       std::unique_ptr<InputConnector::EventSink> input_events_sink,
-      KernelLogEventsHandler *kernel_log_events_handler,
+      KernelLogEventsHandler &kernel_log_events_handler,
       std::map<std::string, SharedFD> commands_to_custom_action_servers,
       std::weak_ptr<DisplayHandler> display_handler,
       CameraController *camera_controller,
-      std::shared_ptr<webrtc_streaming::SensorsHandler> sensors_handler,
+      webrtc_streaming::SensorsHandler &sensors_handler,
       std::shared_ptr<webrtc_streaming::LightsObserver> lights_observer)
       : input_events_sink_(std::move(input_events_sink)),
         kernel_log_events_handler_(kernel_log_events_handler),
@@ -73,7 +77,7 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
       display_handler->RemoveDisplayClient();
     }
     if (kernel_log_subscription_id_ != -1) {
-      kernel_log_events_handler_->Unsubscribe(kernel_log_subscription_id_);
+      kernel_log_events_handler_.Unsubscribe(kernel_log_subscription_id_);
     }
   }
 
@@ -107,9 +111,8 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
   }
 
   Result<void> OnMultiTouchEvent(const std::string &device_label,
-                                 Json::Value id, Json::Value slot,
-                                 Json::Value x, Json::Value y, bool down,
-                                 int size) {
+                                 Json::Value id, Json::Value x, Json::Value y,
+                                 bool down, int size) {
     std::vector<MultitouchSlot> slots(size);
     for (int i = 0; i < size; i++) {
       slots[i].id = id[i].asInt();
@@ -153,7 +156,7 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
       camera_controller_->SetMessageSender(control_message_sender);
     }
     kernel_log_subscription_id_ =
-        kernel_log_events_handler_->AddSubscriber(control_message_sender);
+        kernel_log_events_handler_.AddSubscriber(control_message_sender);
   }
 
   Result<void> OnLidStateChange(bool lid_open) override {
@@ -222,12 +225,13 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
 
   void OnSensorsChannelOpen(std::function<bool(const uint8_t *, size_t)>
                                 sensors_message_sender) override {
-    sensors_subscription_id = sensors_handler_->Subscribe(sensors_message_sender);
+    sensors_subscription_id =
+        sensors_handler_.Subscribe(sensors_message_sender);
     LOG(VERBOSE) << "Sensors channel open";
   }
 
   void OnSensorsChannelClosed() override {
-    sensors_handler_->UnSubscribe(sensors_subscription_id);
+    sensors_handler_.UnSubscribe(sensors_subscription_id);
   }
 
   void OnSensorsMessage(const uint8_t *msg, size_t size) override {
@@ -235,7 +239,8 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
     std::vector<std::string> xyz = android::base::Split(msgstr, " ");
 
     if (xyz.size() != 3) {
-      LOG(WARNING) << "Invalid rotation angles: Expected 3, received " << xyz.size();
+      LOG(WARNING) << "Invalid rotation angles: Expected 3, received "
+                   << xyz.size();
       return;
     }
 
@@ -246,7 +251,7 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
         << "Y rotation value must be a double";
     CHECK(android::base::ParseDouble(xyz.at(2), &z))
         << "Z rotation value must be a double";
-    sensors_handler_->HandleMessage(x, y, z);
+    sensors_handler_.HandleMessage(x, y, z);
   }
 
   void OnLightsChannelOpen(
@@ -335,6 +340,54 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
     SendLastFrameAsync(display_number);
   }
 
+  void OnDisplayAddMsg(const Json::Value &msg) override {
+    auto result = HandleDisplayAddMessage(msg);
+    if (!result.ok()) {
+      LOG(ERROR) << result.error().FormatForEnv();
+    }
+  }
+
+  Result<void> HandleDisplayAddMessage(const Json::Value &msg) {
+    auto width = CF_EXPECT(GetValue<int>(msg, {"width"}));
+    auto height = CF_EXPECT(GetValue<int>(msg, {"height"}));
+    auto dpi = CF_EXPECT(GetValue<int>(msg, {"dpi"}));
+    auto refresh_rate_hz = CF_EXPECT(GetValue<int>(msg, {"refresh_rate_hz"}));
+
+    auto display_config = CuttlefishConfig::DisplayConfig{
+        .width = width,
+        .height = height,
+        .dpi = dpi,
+        .refresh_rate_hz = refresh_rate_hz,
+    };
+
+    auto crosvm_display_conroller =
+        CF_EXPECT(vm_manager::GetCrosvmDisplayController());
+
+    int const instance_num = cuttlefish::GetInstance();
+    CF_EXPECT(crosvm_display_conroller.Add(instance_num, {display_config}));
+
+    return {};
+  }
+
+  void OnDisplayRemoveMsg(const Json::Value &msg) override {
+    auto result = HandleDisplayRemoveMessage(msg);
+    if (!result.ok()) {
+      LOG(ERROR) << result.error().FormatForEnv();
+    }
+  }
+
+  Result<void> HandleDisplayRemoveMessage(const Json::Value &msg) {
+    auto display_id = CF_EXPECT(GetValue<std::string>(msg, {"display_id"}));
+
+    auto crosvm_display_conroller =
+        CF_EXPECT(vm_manager::GetCrosvmDisplayController());
+
+    int const instance_num = cuttlefish::GetInstance();
+    CF_EXPECT(crosvm_display_conroller.Remove(instance_num, {display_id}));
+
+    return {};
+  }
+
   void OnCameraData(const std::vector<char> &data) override {
     if (camera_controller_) {
       camera_controller_->HandleMessage(data);
@@ -369,7 +422,7 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
   }
 
   std::unique_ptr<InputConnector::EventSink> input_events_sink_;
-  KernelLogEventsHandler *kernel_log_events_handler_;
+  KernelLogEventsHandler &kernel_log_events_handler_;
   int kernel_log_subscription_id_ = -1;
   std::shared_ptr<webrtc_streaming::AdbHandler> adb_handler_;
   std::shared_ptr<webrtc_streaming::BluetoothHandler> bluetooth_handler_;
@@ -379,7 +432,7 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
   std::map<std::string, SharedFD> commands_to_custom_action_servers_;
   std::weak_ptr<DisplayHandler> weak_display_handler_;
   CameraController *camera_controller_;
-  std::shared_ptr<webrtc_streaming::SensorsHandler> sensors_handler_;
+  webrtc_streaming::SensorsHandler& sensors_handler_;
   std::shared_ptr<webrtc_streaming::LightsObserver> lights_observer_;
   int sensors_subscription_id = -1;
   int lights_subscription_id_ = -1;
@@ -387,10 +440,12 @@ class ConnectionObserverImpl : public webrtc_streaming::ConnectionObserver {
 
 CfConnectionObserverFactory::CfConnectionObserverFactory(
     InputConnector &input_connector,
-    KernelLogEventsHandler *kernel_log_events_handler,
+    KernelLogEventsHandler &kernel_log_events_handler,
+    webrtc_streaming::SensorsHandler &sensors_handler,
     std::shared_ptr<webrtc_streaming::LightsObserver> lights_observer)
     : input_connector_(input_connector),
       kernel_log_events_handler_(kernel_log_events_handler),
+      sensors_handler_(sensors_handler),
       lights_observer_(lights_observer) {}
 
 std::shared_ptr<webrtc_streaming::ConnectionObserver>
@@ -399,7 +454,7 @@ CfConnectionObserverFactory::CreateObserver() {
       new ConnectionObserverImpl(
           input_connector_.CreateSink(), kernel_log_events_handler_,
           commands_to_custom_action_servers_, weak_display_handler_,
-          camera_controller_, shared_sensors_handler_, lights_observer_));
+          camera_controller_, sensors_handler_, lights_observer_));
 }
 
 void CfConnectionObserverFactory::AddCustomActionServer(

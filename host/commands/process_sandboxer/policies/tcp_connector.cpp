@@ -16,9 +16,10 @@
 
 #include "host/commands/process_sandboxer/policies.h"
 
+#include <sys/socket.h>
 #include <sys/syscall.h>
 
-#include <sandboxed_api/sandbox2/allow_unrestricted_networking.h>
+#include <sandboxed_api/sandbox2/allowlists/unrestricted_networking.h>
 #include <sandboxed_api/sandbox2/policybuilder.h>
 #include <sandboxed_api/sandbox2/util/bpf_helper.h>
 
@@ -26,7 +27,7 @@ namespace cuttlefish::process_sandboxer {
 
 sandbox2::PolicyBuilder TcpConnectorPolicy(const HostInfo& host) {
   return BaselinePolicy(host, host.HostToolExe("tcp_connector"))
-      .AddDirectory(host.environments_uds_dir, /* is_ro= */ false)
+      .AddDirectory(host.EnvironmentsUdsDir(), /* is_ro= */ false)
       .AddDirectory(host.log_dir, /* is_ro= */ false)
       .AddFile(host.cuttlefish_config_path)
       .AddPolicyOnSyscall(__NR_socket, {ARG_32(0), JEQ32(AF_INET, ALLOW),

@@ -35,12 +35,17 @@
 #include <android-base/logging.h>
 #include <vulkan/vulkan.h>
 
+#include "common/libs/utils/architecture.h"
 #include "common/libs/utils/files.h"
 #include "common/libs/utils/result.h"
 #include "common/libs/utils/subprocess.h"
 #include "host/libs/config/command_source.h"
 #include "host/libs/config/cuttlefish_config.h"
 #include "host/libs/vm_manager/vhost_user.h"
+
+// This is the QEMU default, but set it explicitly just in case it
+// changes upstream
+static const int kMaxSerialPorts = 31;
 
 namespace cuttlefish {
 namespace vm_manager {
@@ -154,10 +159,12 @@ QemuManager::ConfigureGraphics(
     };
   } else if (gpu_mode == kGpuModeGfxstream ||
              gpu_mode == kGpuModeGfxstreamGuestAngle ||
-             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader) {
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
     const bool uses_angle =
         gpu_mode == kGpuModeGfxstreamGuestAngle ||
-        gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader;
+        gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+        gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe;
     const std::string gles_impl = uses_angle ? "angle" : "emulation";
     const std::string gltransport =
         (instance.guest_android_version() == "11.0.0") ? "virtio-gpu-pipe"
@@ -350,28 +357,46 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
   qemu_cmd.AddParameter("-name");
   qemu_cmd.AddParameter("guest=", instance.instance_name(), ",debug-threads=on");
 
-  qemu_cmd.AddParameter("-machine");
   std::string machine = is_x86 ? "pc,nvdimm=on" : "virt";
-  if (IsHostCompatible(arch_)) {
-#ifdef __linux__
-    machine += ",accel=kvm";
-#elif defined(__APPLE__)
-    machine += ",accel=hvf";
-#else
-#error "Unknown OS"
-#endif
-    if (is_arm) {
+  if (is_arm) {
+    if (IsHostCompatible(arch_)) {
       machine += ",gic-version=3";
+    } else {
+      // QEMU doesn't support GICv3 with TCG yet
+      machine += ",gic-version=2";
+      CF_EXPECT(instance.cpus() <= 8, "CPUs must be no more than 8 with GICv2");
     }
-  } else if (is_arm) {
-    // QEMU doesn't support GICv3 with TCG yet
-    machine += ",gic-version=2";
-    CF_EXPECT(instance.cpus() <= 8, "CPUs must be no more than 8 with GICv2");
   }
   if (instance.mte()) {
     machine += ",mte=on";
   }
-  qemu_cmd.AddParameter(machine, ",usb=off,dump-guest-core=off");
+  qemu_cmd.AddParameter("-machine");
+  qemu_cmd.AddParameter(machine, ",usb=off,dump-guest-core=off,memory-backend=vm_ram");
+
+  if (IsHostCompatible(arch_)) {
+    qemu_cmd.AddParameter("-accel");
+    std::string accel;
+#ifdef __linux__
+    accel = "kvm";
+    if (!config.kvm_path().empty()) {
+      accel += ",device=" + config.kvm_path();
+    }
+#elif defined(__APPLE__)
+    accel = "hvf";
+#else
+#error "Unknown OS"
+#endif
+    qemu_cmd.AddParameter(accel);
+  }
+
+  // Memory must be backed by a file for vhost-user to work correctly, otherwise
+  // qemu doesn't send the memory mappings necessary for the backend to access
+  // the virtqueues.
+  qemu_cmd.AddParameter("-object");
+  qemu_cmd.AddParameter("memory-backend-file,size=", instance.memory_mb(), "M",
+                        ",prealloc=on,share=on,mem-path=",
+                        instance.PerInstanceInternalPath("qemu.mem"),
+                        ",id=vm_ram");
 
   qemu_cmd.AddParameter("-m");
   auto maxmem = instance.memory_mb() +
@@ -428,7 +453,8 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
   } else if (gpu_mode == kGpuModeGuestSwiftshader ||
              gpu_mode == kGpuModeGfxstream ||
              gpu_mode == kGpuModeGfxstreamGuestAngle ||
-             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader) {
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+             gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
     qemu_cmd.AddParameter("-vnc");
     qemu_cmd.AddParameter("127.0.0.1:", instance.qemu_vnc_server_port());
   } else {
@@ -453,7 +479,8 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
           "virtio-gpu-rutabaga,x-gfxstream-gles=on,gfxstream-vulkan=on,"
           "x-gfxstream-composer=on,hostmem=256M";
     } else if (gpu_mode == kGpuModeGfxstreamGuestAngle ||
-               gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader) {
+               gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+               gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
       gpu_device =
           "virtio-gpu-rutabaga,gfxstream-vulkan=on,"
           "x-gfxstream-composer=on,hostmem=256M";
@@ -466,6 +493,12 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
                                         swiftshader_icd_json);
         qemu_cmd.AddEnvironmentVariable("VK_ICD_FILENAMES",
                                         swiftshader_icd_json);
+      } else if (gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
+        // See https://github.com/KhronosGroup/Vulkan-Loader.
+        const std::string lavapipe_icd_json =
+            HostUsrSharePath("vulkan/icd.d/vk_lavapipe_icd.cf.json");
+        qemu_cmd.AddEnvironmentVariable("VK_DRIVER_FILES", lavapipe_icd_json);
+        qemu_cmd.AddEnvironmentVariable("VK_ICD_FILENAMES", lavapipe_icd_json);
       }
     }
 
@@ -488,7 +521,8 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
 
   qemu_cmd.AddParameter("-device");
   qemu_cmd.AddParameter(
-      "virtio-serial-pci-non-transitional,max_ports=31,id=virtio-serial");
+      "virtio-serial-pci-non-transitional,max_ports=", kMaxSerialPorts,
+      ",id=virtio-serial");
 
   // /dev/hvc0 = kernel console
   // If kernel log is enabled, the virtio-console port will be specified as
@@ -590,10 +624,8 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
     add_hvc_sink();
   }
 
-  // sensors_fifo_vm.{in/out} are created along with the streamer process,
-  // which is not created w/ QEMU.
   // /dev/hvc13 = sensors
-  add_hvc_sink();
+  add_hvc(instance.PerInstanceInternalPath("sensors_fifo_vm"));
 
   // /dev/hvc14 = MCU CONTROL
   if (instance.mcu()["control"]["type"].asString() == "serial") {
@@ -609,6 +641,15 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
     auto path = instance.PerInstanceInternalPath("mcu");
     path += "/" + instance.mcu()["uart0"]["path"].asString();
     add_hvc_serial(path);
+  } else {
+    add_hvc_sink();
+  }
+
+  // /dev/hvc16 = Ti50 TPM FIFO
+  if (!instance.ti50_emulator().empty()) {
+    // TODO
+    // add_hvc_socket(instance.PerInstancePath("direct_tpm_fifo"));
+    add_hvc_sink();
   } else {
     add_hvc_sink();
   }
@@ -710,6 +751,8 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
   qemu_cmd.AddParameter("virtio-rng-pci-non-transitional,rng=objrng0,id=rng0,",
                         "max-bytes=1024,period=2000");
 
+  // TODO: Use the vhost-user devices instead if/when qemu is accessed via
+  // webRTC instead of VNC.
   qemu_cmd.AddParameter("-device");
   qemu_cmd.AddParameter("virtio-mouse-pci,disable-legacy=on");
 
@@ -717,40 +760,53 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
   qemu_cmd.AddParameter("virtio-keyboard-pci,disable-legacy=on");
 
   // device padding for unsupported "switches" input
+  qemu_cmd.AddParameter("-chardev");
+  qemu_cmd.AddParameter("socket,path=", instance.switches_socket_path(), ",id=switches0");
   qemu_cmd.AddParameter("-device");
-  qemu_cmd.AddParameter("virtio-keyboard-pci,disable-legacy=on");
+  qemu_cmd.AddParameter("vhost-user-input-pci,chardev=switches0");
+
+  qemu_cmd.AddParameter("-chardev");
+  qemu_cmd.AddParameter("socket,path=", instance.rotary_socket_path(), ",id=rotary0");
+  qemu_cmd.AddParameter("-device");
+  qemu_cmd.AddParameter("vhost-user-input-pci,chardev=rotary0");
 
   auto vhost_net = instance.vhost_net() ? ",vhost=on" : "";
 
   qemu_cmd.AddParameter("-device");
   qemu_cmd.AddParameter("virtio-balloon-pci-non-transitional,id=balloon0");
 
+  bool has_network_devices = false;
   switch (instance.external_network_mode()) {
     case ExternalNetworkMode::kTap:
-      qemu_cmd.AddParameter("-netdev");
-      qemu_cmd.AddParameter(
-          "tap,id=hostnet0,ifname=", instance.mobile_tap_name(),
-          ",script=no,downscript=no", vhost_net);
-
-      qemu_cmd.AddParameter("-netdev");
-      qemu_cmd.AddParameter(
-          "tap,id=hostnet1,ifname=", instance.ethernet_tap_name(),
-          ",script=no,downscript=no", vhost_net);
-
-      if (!config.virtio_mac80211_hwsim()) {
+      if (instance.enable_tap_devices()) {
+        has_network_devices = true;
         qemu_cmd.AddParameter("-netdev");
         qemu_cmd.AddParameter(
-            "tap,id=hostnet2,ifname=", instance.wifi_tap_name(),
+            "tap,id=hostnet0,ifname=", instance.mobile_tap_name(),
             ",script=no,downscript=no", vhost_net);
+
+        qemu_cmd.AddParameter("-netdev");
+        qemu_cmd.AddParameter(
+            "tap,id=hostnet1,ifname=", instance.ethernet_tap_name(),
+            ",script=no,downscript=no", vhost_net);
+
+        if (!config.virtio_mac80211_hwsim()) {
+          qemu_cmd.AddParameter("-netdev");
+          qemu_cmd.AddParameter(
+              "tap,id=hostnet2,ifname=", instance.wifi_tap_name(),
+              ",script=no,downscript=no", vhost_net);
+        }
       }
       break;
     case cuttlefish::ExternalNetworkMode::kSlirp: {
+      has_network_devices = true;
       const std::string net =
           fmt::format("{}/{}", instance.ril_ipaddr(), instance.ril_prefixlen());
       const std::string& host = instance.ril_gateway();
       qemu_cmd.AddParameter("-netdev");
       // TODO(schuffelen): `dns` needs to match the first `nameserver` in
-      // `/etc/resolv.conf`. Implement something that generalizes beyond gLinux.
+      // `/etc/resolv.conf`. Implement something that generalizes beyond
+      // gLinux.
       qemu_cmd.AddParameter("user,id=hostnet0,net=", net, ",host=", host,
                             ",dns=127.0.0.1");
 
@@ -768,19 +824,23 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
                      instance.external_network_mode());
   }
 
-  // The ordering of virtio-net devices is important. Make sure any change here
-  // is reflected in ethprime u-boot variable
-  qemu_cmd.AddParameter("-device");
-  qemu_cmd.AddParameter(
-      "virtio-net-pci-non-transitional,netdev=hostnet0,id=net0,mac=",
-      instance.mobile_mac());
-  qemu_cmd.AddParameter("-device");
-  qemu_cmd.AddParameter("virtio-net-pci-non-transitional,netdev=hostnet1,id=net1,mac=",
-                        instance.ethernet_mac());
-  if (!config.virtio_mac80211_hwsim()) {
+  if (has_network_devices) {
+    // The ordering of virtio-net devices is important. Make sure any change
+    // here is reflected in ethprime u-boot variable
     qemu_cmd.AddParameter("-device");
-    qemu_cmd.AddParameter("virtio-net-pci-non-transitional,netdev=hostnet2,id=net2,mac=",
-                          instance.wifi_mac());
+    qemu_cmd.AddParameter(
+        "virtio-net-pci-non-transitional,netdev=hostnet0,id=net0,mac=",
+        instance.mobile_mac());
+    qemu_cmd.AddParameter("-device");
+    qemu_cmd.AddParameter(
+        "virtio-net-pci-non-transitional,netdev=hostnet1,id=net1,mac=",
+        instance.ethernet_mac());
+    if (!config.virtio_mac80211_hwsim()) {
+      qemu_cmd.AddParameter("-device");
+      qemu_cmd.AddParameter(
+          "virtio-net-pci-non-transitional,netdev=hostnet2,id=net2,mac=",
+          instance.wifi_mac());
+    }
   }
 
   if (is_x86 || is_arm) {
@@ -835,6 +895,14 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
     qemu_cmd.AddParameter("-S");
     qemu_cmd.AddParameter("-gdb");
     qemu_cmd.AddParameter("tcp::", instance.gdb_port());
+  }
+
+  // After all other devices are added, add some more console sinks
+  // so it doesn't upset any sepolicy, but works around a QEMU warning
+  // when U-Boot probes the ports between kDefaultNumHvcs and
+  // kMaxSerialPorts
+  while (hvc_num < kMaxSerialPorts) {
+    add_hvc_sink();
   }
 
   commands.emplace_back(std::move(qemu_cmd), true);

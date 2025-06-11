@@ -38,12 +38,16 @@
 #include <json/json.h>
 #include <json/writer.h>
 
+#include "common/libs/utils/architecture.h"
 #include "common/libs/utils/base64.h"
+#include "common/libs/utils/container.h"
 #include "common/libs/utils/contains.h"
+#include "common/libs/utils/environment.h"
 #include "common/libs/utils/files.h"
 #include "common/libs/utils/flag_parser.h"
 #include "common/libs/utils/in_sandbox.h"
 #include "common/libs/utils/json.h"
+#include "common/libs/utils/known_paths.h"
 #include "common/libs/utils/network.h"
 #include "host/commands/assemble_cvd/alloc.h"
 #include "host/commands/assemble_cvd/boot_config.h"
@@ -72,7 +76,7 @@
 
 using cuttlefish::DefaultHostArtifactsPath;
 using cuttlefish::HostBinaryPath;
-using cuttlefish::StringFromEnv;
+using cuttlefish::TempDir;
 using cuttlefish::vm_manager::CrosvmManager;
 using google::FlagSettingMode::SET_FLAGS_DEFAULT;
 using google::FlagSettingMode::SET_FLAGS_VALUE;
@@ -115,6 +119,9 @@ DEFINE_string(x_res, "0", "Width of the screen in pixels");
 DEFINE_string(y_res, "0", "Height of the screen in pixels");
 DEFINE_string(dpi, "0", "Pixels per inch for the screen");
 DEFINE_string(refresh_rate_hz, "60", "Screen refresh rate in Hertz");
+DEFINE_string(overlays, "",
+              "List of displays to overlay. Format is: 'vm_index:display_index "
+              "vm_index2:display_index2 [...]'");
 DEFINE_bool(use_16k, false, "Launch using 16k kernel");
 DEFINE_vec(kernel_path, CF_DEFAULTS_KERNEL_PATH,
               "Path to the kernel. Overrides the one from the boot image");
@@ -140,7 +147,8 @@ DEFINE_vec(vm_manager, CF_DEFAULTS_VM_MANAGER,
 DEFINE_vec(gpu_mode, CF_DEFAULTS_GPU_MODE,
            "What gpu configuration to use, one of {auto, custom, drm_virgl, "
            "gfxstream, gfxstream_guest_angle, "
-           "gfxstream_guest_angle_host_swiftshader, guest_swiftshader}");
+           "gfxstream_guest_angle_host_swiftshader, "
+           "gfxstream_guest_angle_host_lavapipe, guest_swiftshader}");
 DEFINE_vec(gpu_vhost_user_mode,
            fmt::format("{}", CF_DEFAULTS_GPU_VHOST_USER_MODE),
            "Whether or not to run the Virtio GPU worker in a separate"
@@ -163,6 +171,15 @@ DEFINE_vec(gpu_context_types, CF_DEFAULTS_GPU_CONTEXT_TYPES,
            "A colon separated list of virtio-gpu context types.  Only valid "
            "with --gpu_mode=custom."
            " For example \"--gpu_context_types=cross_domain:gfxstream\"");
+
+DEFINE_vec(
+    guest_hwui_renderer, CF_DEFAULTS_GUEST_HWUI_RENDERER,
+    "The default renderer that HWUI should use, one of {skiagl, skiavk}.");
+
+DEFINE_vec(guest_renderer_preload, CF_DEFAULTS_GUEST_RENDERER_PRELOAD,
+           "Whether or not Zygote renderer preload is disabled, one of {auto, "
+           "enabled, disabled}. Auto will choose whether or not to disable "
+           "based on the gpu mode and guest hwui renderer.");
 
 DEFINE_vec(
     guest_vulkan_driver, CF_DEFAULTS_GUEST_VULKAN_DRIVER,
@@ -494,6 +511,15 @@ DEFINE_vec(crosvm_use_rng, "true",
            "Controls the crosvm --no-rng flag"
            "The flag is given if crosvm_use_rng is false");
 
+DEFINE_vec(crosvm_simple_media_device, "false",
+           "Controls the crosvm --simple-media-device flag"
+           "The flag is given if crosvm_simple_media_device is true.");
+
+DEFINE_vec(crosvm_v4l2_proxy, CF_DEFAULTS_CROSVM_V4L2_PROXY,
+           "Controls the crosvm --v4l2-proxy flag"
+           "The flag is given if crosvm_v4l2_proxy is set with a valid string literal. "
+           "When this flag is set, crosvm_simple_media_device becomes ineffective.");
+
 DEFINE_vec(use_pmem, "true",
            "Make this flag false to disable pmem with crosvm");
 
@@ -521,8 +547,12 @@ DEFINE_vec(
 DEFINE_vec(vhost_user_block, CF_DEFAULTS_VHOST_USER_BLOCK ? "true" : "false",
            "(experimental) use crosvm vhost-user block device implementation ");
 
-DEFINE_string(early_tmp_dir, cuttlefish::StringFromEnv("TEMP", "/tmp"),
+DEFINE_string(early_tmp_dir, TempDir(),
               "Parent directory to use for temporary files in early startup");
+
+DEFINE_vec(enable_tap_devices, "true",
+           "TAP devices are used on linux for connecting to the network "
+           "outside the current machine.");
 
 DECLARE_string(assembly_dir);
 DECLARE_string(boot_image);
@@ -531,6 +561,13 @@ DECLARE_string(snapshot_path);
 
 DEFINE_vec(vcpu_config_path, CF_DEFAULTS_VCPU_CONFIG_PATH,
            "configuration file for Virtual Cpufreq");
+
+DEFINE_string(kvm_path, "",
+              "Device node file used to create VMs. Uses a default if empty.");
+
+DEFINE_string(vhost_vsock_path, "",
+              "Device node file for the kernel vhost-vsock implementation. "
+              "Uses a default if empty. Ignored for QEMU.");
 
 namespace cuttlefish {
 using vm_manager::QemuManager;
@@ -692,7 +729,14 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
           system_image_dir[instance_index] + "/android-info.txt";
     }
 
-    auto res = GetAndroidInfoConfig(instance_android_info_txt, "gfxstream");
+    auto res = GetAndroidInfoConfig(instance_android_info_txt, "device_type");
+    // If that "device_type" is not explicitly set, fall back to parse "config".
+    if (!res.ok()) {
+      res = GetAndroidInfoConfig(instance_android_info_txt, "config");
+    }
+    guest_config.device_type = ParseDeviceType(res.value_or(""));
+
+    res = GetAndroidInfoConfig(instance_android_info_txt, "gfxstream");
     guest_config.gfxstream_supported =
         res.ok() && res.value() == "supported";
 
@@ -705,6 +749,20 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
         GetAndroidInfoConfig(instance_android_info_txt, "mouse");
     guest_config.mouse_supported =
         res_mouse_support.ok() && res_mouse_support.value() == "supported";
+
+    auto res_custom_keyboard_config =
+        GetAndroidInfoConfig(instance_android_info_txt, "custom_keyboard");
+    if (res_custom_keyboard_config.ok()) {
+      guest_config.custom_keyboard_config =
+          DefaultHostArtifactsPath(res_custom_keyboard_config.value());
+    }
+
+    auto res_domkey_mapping_config =
+        GetAndroidInfoConfig(instance_android_info_txt, "domkey_mapping");
+    if (res_domkey_mapping_config.ok()) {
+      guest_config.domkey_mapping_config =
+          DefaultHostArtifactsPath(res_domkey_mapping_config.value());
+    }
 
     auto res_bgra_support = GetAndroidInfoConfig(instance_android_info_txt,
                                                  "supports_bgra_framebuffers");
@@ -719,6 +777,21 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
         instance_android_info_txt, "prefer_drm_virgl_when_supported");
     guest_config.prefer_drm_virgl_when_supported =
         res_prefer_drm_virgl_when_supported.value_or("") == "true";
+
+    auto res_ti50_emulator =
+        GetAndroidInfoConfig(instance_android_info_txt, "ti50_emulator");
+    guest_config.ti50_emulator = res_ti50_emulator.value_or("");
+    auto res_output_audio_streams_count = GetAndroidInfoConfig(
+        instance_android_info_txt, "output_audio_streams_count");
+    if (res_output_audio_streams_count.ok()) {
+      std::string output_audio_streams_count_str =
+          res_output_audio_streams_count.value();
+      CF_EXPECT(
+          android::base::ParseInt(output_audio_streams_count_str.c_str(),
+                                  &guest_config.output_audio_streams_count),
+          "Failed to parse value \"" << output_audio_streams_count_str
+                                     << "\" for output audio stream count");
+    }
 
     guest_configs.push_back(guest_config);
   }
@@ -744,9 +817,10 @@ Result<ProtoType> ParseBinProtoFlagHelper(const std::string& flag_value,
   std::vector<uint8_t> output;
   CF_EXPECT(DecodeBase64(flag_value, &output));
   std::string serialized = std::string(output.begin(), output.end());
-
+  bool result = proto_result.ParseFromString(serialized);
   CF_EXPECT(proto_result.ParseFromString(serialized),
-            "Failed to parse binary proto, flag: "<< flag_name << ", value: " << flag_value);
+            "Failed to parse binary proto, flag: " << flag_name << ", value: "
+                                                   << flag_value);
   return proto_result;
 }
 
@@ -756,10 +830,12 @@ Result<std::vector<std::vector<CuttlefishConfig::DisplayConfig>>>
   ParseBinProtoFlagHelper<InstancesDisplays>(FLAGS_displays_binproto, "displays_binproto") : \
   ParseTextProtoFlagHelper<InstancesDisplays>(FLAGS_displays_textproto, "displays_textproto");
 
+  InstancesDisplays display_proto = CF_EXPECT(std::move(proto_result));
+
   std::vector<std::vector<CuttlefishConfig::DisplayConfig>> result;
-  for (int i=0; i<proto_result->instances_size(); i++) {
+  for (int i = 0; i < display_proto.instances_size(); i++) {
     std::vector<CuttlefishConfig::DisplayConfig> display_configs;
-    const InstanceDisplays& launch_cvd_instance = proto_result->instances(i);
+    const InstanceDisplays& launch_cvd_instance = display_proto.instances(i);
     for (int display_num=0; display_num<launch_cvd_instance.displays_size(); display_num++) {
       const InstanceDisplay& display = launch_cvd_instance.displays(display_num);
 
@@ -774,15 +850,26 @@ Result<std::vector<std::vector<CuttlefishConfig::DisplayConfig>>>
         display_refresh_rate_hz = display.refresh_rate_hertz();
       }
 
-      display_configs.push_back(CuttlefishConfig::DisplayConfig{
-        .width = display.width(),
-        .height = display.height(),
-        .dpi = display_dpi,
-        .refresh_rate_hz = display_refresh_rate_hz,
-        });
+      std::string overlays = "";
+
+      for (const auto& overlay : display.overlays()) {
+        overlays +=
+            fmt::format("{}:{} ", overlay.vm_index(), overlay.display_index());
+      }
+
+      auto dc = CuttlefishConfig::DisplayConfig{
+          .width = display.width(),
+          .height = display.height(),
+          .dpi = display_dpi,
+          .refresh_rate_hz = display_refresh_rate_hz,
+          .overlays = overlays,
+      };
+
+      display_configs.push_back(dc);
     }
     result.push_back(display_configs);
   }
+
   return result;
 }
 
@@ -973,7 +1060,8 @@ Result<void> CheckSnapshotCompatible(
 }
 
 std::optional<std::string> EnvironmentUdsDir() {
-  auto environments_uds_dir = "/tmp/cf_env_" + std::to_string(getuid());
+  std::string environments_uds_dir =
+      fmt::format("{}/cf_env_{}", TempDir(), getuid());
   if (DirectoryExists(environments_uds_dir) &&
       !CanAccess(environments_uds_dir, R_OK | W_OK | X_OK)) {
     return std::nullopt;
@@ -982,12 +1070,27 @@ std::optional<std::string> EnvironmentUdsDir() {
 }
 
 std::optional<std::string> InstancesUdsDir() {
-  auto instances_uds_dir = "/tmp/cf_avd_" + std::to_string(getuid());
+  std::string instances_uds_dir =
+      fmt::format("{}/cf_avd_{}", TempDir(), getuid());
   if (DirectoryExists(instances_uds_dir) &&
       !CanAccess(instances_uds_dir, R_OK | W_OK | X_OK)) {
     return std::nullopt;
   }
   return instances_uds_dir;
+}
+
+std::string DefaultBootloaderArchDir(Arch arch) {
+  switch (arch) {
+    case Arch::Arm64:
+      return "aarch64";
+    case Arch::Arm:
+      return "arm";
+    case Arch::RiscV64:
+      return "riscv64";
+    case Arch::X86:
+    case Arch::X86_64:
+      return "x86_64";
+  }
 }
 
 } // namespace
@@ -1142,6 +1245,8 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
   std::vector<int> dpi_vec = CF_EXPECT(GET_FLAG_INT_VALUE(dpi));
   std::vector<int> refresh_rate_hz_vec = CF_EXPECT(GET_FLAG_INT_VALUE(
       refresh_rate_hz));
+  std::vector<std::string> overlays_vec =
+      CF_EXPECT(GET_FLAG_STR_VALUE(overlays));
   std::vector<int> memory_mb_vec = CF_EXPECT(GET_FLAG_INT_VALUE(memory_mb));
   std::vector<int> camera_server_port_vec = CF_EXPECT(GET_FLAG_INT_VALUE(
       camera_server_port));
@@ -1227,6 +1332,10 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
       CF_EXPECT(GET_FLAG_STR_VALUE(gpu_renderer_features));
   std::vector<std::string> gpu_context_types_vec =
       CF_EXPECT(GET_FLAG_STR_VALUE(gpu_context_types));
+  std::vector<std::string> guest_hwui_renderer_vec =
+      CF_EXPECT(GET_FLAG_STR_VALUE(guest_hwui_renderer));
+  std::vector<std::string> guest_renderer_preload_vec =
+      CF_EXPECT(GET_FLAG_STR_VALUE(guest_renderer_preload));
   std::vector<std::string> guest_vulkan_driver_vec =
       CF_EXPECT(GET_FLAG_STR_VALUE(guest_vulkan_driver));
   std::vector<std::string> frames_socket_path_vec =
@@ -1266,6 +1375,10 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
       CF_EXPECT(GET_FLAG_BOOL_VALUE(crosvm_use_balloon));
   std::vector<bool> use_rng_vec =
       CF_EXPECT(GET_FLAG_BOOL_VALUE(crosvm_use_rng));
+  std::vector<bool> simple_media_device_vec =
+      CF_EXPECT(GET_FLAG_BOOL_VALUE(crosvm_simple_media_device));
+  std::vector<std::string> v4l2_proxy_vec =
+      CF_EXPECT(GET_FLAG_STR_VALUE(crosvm_v4l2_proxy));
   std::vector<bool> use_pmem_vec = CF_EXPECT(GET_FLAG_BOOL_VALUE(use_pmem));
   const bool restore_from_snapshot = !std::string(FLAGS_snapshot_path).empty();
   std::vector<std::string> device_external_network_vec =
@@ -1280,6 +1393,9 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
 
   std::vector<std::string> vcpu_config_vec =
       CF_EXPECT(GET_FLAG_STR_VALUE(vcpu_config_path));
+
+  std::vector<bool> enable_tap_devices_vec =
+      CF_EXPECT(GET_FLAG_BOOL_VALUE(enable_tap_devices));
 
   std::string default_enable_sandbox = "";
   std::string default_enable_virtiofs = "";
@@ -1356,6 +1472,9 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
              << (FLAGS_enable_vhal_proxy_server &&
                  vhal_proxy_server_instance_num <= 0);
 
+  tmp_config_obj.set_kvm_path(FLAGS_kvm_path);
+  tmp_config_obj.set_vhost_vsock_path(FLAGS_vhost_vsock_path);
+
   // Environment specific configs
   // Currently just setting for the default environment
   auto environment_name =
@@ -1363,6 +1482,8 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
   auto mutable_env_config = tmp_config_obj.ForEnvironment(environment_name);
   auto env_config = const_cast<const CuttlefishConfig&>(tmp_config_obj)
                         .ForEnvironment(environment_name);
+
+  mutable_env_config.set_group_uuid(std::time(0));
 
   mutable_env_config.set_enable_wifi(FLAGS_enable_wifi);
 
@@ -1420,9 +1541,19 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
 
     instance.set_crosvm_use_balloon(use_balloon_vec[instance_index]);
     instance.set_crosvm_use_rng(use_rng_vec[instance_index]);
+    instance.set_crosvm_simple_media_device(simple_media_device_vec[instance_index]);
+    instance.set_crosvm_v4l2_proxy(v4l2_proxy_vec[instance_index]);
     instance.set_use_pmem(use_pmem_vec[instance_index]);
     instance.set_bootconfig_supported(guest_configs[instance_index].bootconfig_supported);
     instance.set_enable_mouse(guest_configs[instance_index].mouse_supported);
+    if (guest_configs[instance_index].custom_keyboard_config.has_value()) {
+      instance.set_custom_keyboard_config(
+          guest_configs[instance_index].custom_keyboard_config.value());
+    }
+    if (guest_configs[instance_index].domkey_mapping_config.has_value()) {
+      instance.set_domkey_mapping_config(
+          guest_configs[instance_index].domkey_mapping_config.value());
+    }
     instance.set_filename_encryption_mode(
       guest_configs[instance_index].hctr2_supported ? "hctr2" : "cts");
     instance.set_use_allocd(use_allocd_vec[instance_index]);
@@ -1459,6 +1590,9 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
     instance.set_openthread_node_id(num);
 
     // end of wifi, bluetooth, Thread, connectivity setup
+
+    instance.set_audio_output_streams_count(
+        guest_configs[instance_index].output_audio_streams_count);
 
     if (vhost_user_vsock_vec[instance_index] == kVhostUserVsockModeAuto) {
       std::set<Arch> default_on_arch = {Arch::Arm64};
@@ -1520,6 +1654,7 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
               "instance_index " << instance_index << " out of boundary "
                                 << guest_configs.size());
     instance.set_target_arch(guest_configs[instance_index].target_arch);
+    instance.set_device_type(guest_configs[instance_index].device_type);
     instance.set_guest_android_version(
         guest_configs[instance_index].android_version_number);
     instance.set_console(console_vec[instance_index]);
@@ -1561,7 +1696,8 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
             .height = y_res_vec[instance_index],
             .dpi = dpi_vec[instance_index],
             .refresh_rate_hz = refresh_rate_hz_vec[instance_index],
-          });
+            .overlays = overlays_vec[instance_index],
+        });
       } else {
         LOG(WARNING)
             << "Ignoring --x_res and --y_res when --display specified.";
@@ -1649,7 +1785,9 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
         graphics_availability, gpu_mode_vec[instance_index],
         gpu_vhost_user_mode_vec[instance_index],
         gpu_renderer_features_vec[instance_index],
-        gpu_context_types_vec[instance_index], vmm_mode,
+        gpu_context_types_vec[instance_index],
+        guest_hwui_renderer_vec[instance_index],
+        guest_renderer_preload_vec[instance_index], vmm_mode,
         guest_configs[instance_index], instance));
     calculated_gpu_mode_vec[instance_index] = gpu_mode_vec[instance_index];
 
@@ -1890,6 +2028,16 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
       instance.set_vcpu_config_path(AbsolutePath(vcpu_cfg_path));
     }
 
+    if (!guest_configs[instance_index].ti50_emulator.empty()) {
+      auto ti50_emulator =
+          DefaultHostArtifactsPath(guest_configs[instance_index].ti50_emulator);
+      CF_EXPECT(FileExists(ti50_emulator),
+                "ti50 emulator binary does not exist");
+      instance.set_ti50_emulator(ti50_emulator);
+    }
+
+    instance.set_enable_tap_devices(enable_tap_devices_vec[instance_index]);
+
     instance_index++;
   }  // end of num_instances loop
 
@@ -1945,7 +2093,7 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
 }
 
 Result<void> SetDefaultFlagsForQemu(
-    Arch target_arch,
+    const std::vector<GuestConfig>& guest_configs,
     std::map<std::string, std::string>& name_to_default_value) {
   auto instance_nums =
       CF_EXPECT(InstanceNumsCalculator().FromGlobalGflags().Calculate());
@@ -1956,25 +2104,47 @@ Result<void> SetDefaultFlagsForQemu(
       CF_EXPECT(GET_FLAG_BOOL_VALUE(start_webrtc));
   std::vector<std::string> system_image_dir =
       CF_EXPECT(GET_FLAG_STR_VALUE(system_image_dir));
+  std::string curr_bootloader = "";
   std::string curr_android_efi_loader = "";
+  std::string default_bootloader = "";
   std::string default_android_efi_loader = "";
   std::string default_start_webrtc = "";
 
   for (int instance_index = 0; instance_index < instance_nums.size();
        instance_index++) {
     if (instance_index >= system_image_dir.size()) {
+      curr_bootloader = system_image_dir[0];
       curr_android_efi_loader = system_image_dir[0];
     } else {
+      curr_bootloader = system_image_dir[instance_index];
       curr_android_efi_loader = system_image_dir[instance_index];
     }
+    curr_bootloader += "/bootloader";
     curr_android_efi_loader += "/android_efi_loader.efi";
 
+    // /bootloader isn't presented in the output folder by default and can be
+    // only fetched by --bootloader in fetch_cvd, so pick it only in case
+    // it's presented.
+    if (!FileExists(curr_bootloader)) {
+      // Fallback to default bootloader
+      curr_bootloader = DefaultHostArtifactsPath(std::format(
+          "etc/bootloader_{}/bootloader.qemu",
+          DefaultBootloaderArchDir(guest_configs[instance_index].target_arch)));
+    }
+
     if (instance_index > 0) {
+      default_bootloader += ",";
       default_android_efi_loader += ",";
       default_start_webrtc += ",";
     }
 
-    default_android_efi_loader += curr_android_efi_loader;
+    default_bootloader += curr_bootloader;
+    // EFI loader isn't presented in the output folder by default and can be
+    // only fetched by --uefi_app_build in fetch_cvd, so pick it only in case
+    // it's presented.
+    if (FileExists(curr_android_efi_loader)) {
+      default_android_efi_loader += curr_android_efi_loader;
+    }
     if (gpu_mode_vec[instance_index] == kGpuModeGuestSwiftshader &&
         !start_webrtc_vec[instance_index]) {
       // This makes WebRTC the default streamer unless the user requests
@@ -1991,29 +2161,11 @@ Result<void> SetDefaultFlagsForQemu(
   SetCommandLineOptionWithMode("start_webrtc", default_start_webrtc.c_str(),
                                SET_FLAGS_DEFAULT);
 
-  std::string default_bootloader = DefaultHostArtifactsPath("etc/bootloader_");
-  if (target_arch == Arch::Arm) {
-    // Bootloader is unstable >512MB RAM on 32-bit ARM
-    SetCommandLineOptionWithMode("memory_mb", "512", SET_FLAGS_VALUE);
-    default_bootloader += "arm";
-  } else if (target_arch == Arch::Arm64) {
-    default_bootloader += "aarch64";
-  } else if (target_arch == Arch::RiscV64) {
-    default_bootloader += "riscv64";
-  } else {
-    default_bootloader += "x86_64";
-  }
-  default_bootloader += "/bootloader.qemu";
   SetCommandLineOptionWithMode("bootloader", default_bootloader.c_str(),
                                SET_FLAGS_DEFAULT);
-  // EFI loader isn't presented in the output folder by default and can be only
-  // fetched by --uefi_app_build in fetch_cvd, so pick it only in case it's
-  // presented.
-  if (FileExists(default_android_efi_loader)) {
-    SetCommandLineOptionWithMode("android_efi_loader",
-                                 default_android_efi_loader.c_str(),
-                                 SET_FLAGS_DEFAULT);
-  }
+  SetCommandLineOptionWithMode("android_efi_loader",
+                               default_android_efi_loader.c_str(),
+                               SET_FLAGS_DEFAULT);
   return {};
 }
 
@@ -2036,34 +2188,31 @@ Result<void> SetDefaultFlagsForCrosvm(
   std::vector<std::string> system_image_dir =
       CF_EXPECT(GET_FLAG_STR_VALUE(system_image_dir));
   std::string curr_android_efi_loader = "";
-  std::string cur_bootloader = "";
+  std::string curr_bootloader = "";
   std::string default_android_efi_loader = "";
   std::string default_bootloader = "";
   std::string default_enable_sandbox_str = "";
   for (int instance_index = 0; instance_index < instance_nums.size();
        instance_index++) {
-    if (guest_configs[instance_index].android_version_number == "11.0.0") {
-      cur_bootloader = DefaultHostArtifactsPath("etc/bootloader_");
-      if (guest_configs[instance_index].target_arch == Arch::Arm64) {
-        cur_bootloader += "aarch64";
-      } else {
-        cur_bootloader += "x86_64";
-      }
-      cur_bootloader += "/bootloader.crosvm";
-    } else {
-      if (instance_index >= system_image_dir.size()) {
-        cur_bootloader = system_image_dir[0];
-      } else {
-        cur_bootloader = system_image_dir[instance_index];
-      }
-      cur_bootloader += "/bootloader";
-    }
     if (instance_index >= system_image_dir.size()) {
+      curr_bootloader = system_image_dir[0];
       curr_android_efi_loader = system_image_dir[0];
     } else {
+      curr_bootloader = system_image_dir[instance_index];
       curr_android_efi_loader = system_image_dir[instance_index];
     }
+    curr_bootloader += "/bootloader";
     curr_android_efi_loader += "/android_efi_loader.efi";
+
+    // /bootloader isn't presented in the output folder by default and can be
+    // only fetched by --bootloader in fetch_cvd, so pick it only in case
+    // it's presented.
+    if (!FileExists(curr_bootloader)) {
+      // Fallback to default bootloader
+      curr_bootloader = DefaultHostArtifactsPath(std::format(
+          "etc/bootloader_{}/bootloader.crosvm",
+          DefaultBootloaderArchDir(guest_configs[instance_index].target_arch)));
+    }
 
     if (instance_index > 0) {
       default_bootloader += ",";
@@ -2071,8 +2220,14 @@ Result<void> SetDefaultFlagsForCrosvm(
       default_enable_sandbox_str += ",";
       default_start_webrtc += ",";
     }
-    default_bootloader += cur_bootloader;
-    default_android_efi_loader += curr_android_efi_loader;
+
+    default_bootloader += curr_bootloader;
+    // EFI loader isn't presented in the output folder by default and can be
+    // only fetched by --uefi_app_build in fetch_cvd, so pick it only in case
+    // it's presented.
+    if (FileExists(curr_android_efi_loader)) {
+      default_android_efi_loader += curr_android_efi_loader;
+    }
     default_enable_sandbox_str += fmt::format("{}", default_enable_sandbox);
     if (!start_webrtc_vec[instance_index]) {
       // This makes WebRTC the default streamer unless the user requests
@@ -2086,14 +2241,9 @@ Result<void> SetDefaultFlagsForCrosvm(
   }
   SetCommandLineOptionWithMode("bootloader", default_bootloader.c_str(),
                                SET_FLAGS_DEFAULT);
-  // EFI loader isn't presented in the output folder by default and can be only
-  // fetched by --uefi_app_build in fetch_cvd, so pick it only in case it's
-  // presented.
-  if (FileExists(default_android_efi_loader)) {
-    SetCommandLineOptionWithMode("android_efi_loader",
-                                 default_android_efi_loader.c_str(),
-                                 SET_FLAGS_DEFAULT);
-  }
+  SetCommandLineOptionWithMode("android_efi_loader",
+                               default_android_efi_loader.c_str(),
+                               SET_FLAGS_DEFAULT);
   // This is the 1st place to set "start_webrtc" flag value
   SetCommandLineOptionWithMode("start_webrtc", default_start_webrtc.c_str(),
                                SET_FLAGS_DEFAULT);
@@ -2184,7 +2334,7 @@ Result<std::vector<GuestConfig>> GetGuestConfigAndSetDefaults() {
   auto name_to_default_value = CurrentFlagsToDefaultValue();
 
   if (vmm == VmmMode::kQemu) {
-    CF_EXPECT(SetDefaultFlagsForQemu(guest_configs[0].target_arch, name_to_default_value));
+    CF_EXPECT(SetDefaultFlagsForQemu(guest_configs, name_to_default_value));
   } else if (vmm == VmmMode::kCrosvm) {
     CF_EXPECT(SetDefaultFlagsForCrosvm(guest_configs, name_to_default_value));
   } else if (vmm == VmmMode::kGem5) {
@@ -2236,9 +2386,8 @@ std::string GetConfigFilePath(const CuttlefishConfig& config) {
 }
 
 std::string GetSeccompPolicyDir() {
-  static const std::string kSeccompDir = std::string("usr/share/crosvm/") +
-                                         cuttlefish::HostArchStr() +
-                                         "-linux-gnu/seccomp";
+  std::string kSeccompDir =
+      "usr/share/crosvm/" + HostArchStr() + "-linux-gnu/seccomp";
   return DefaultHostArtifactsPath(kSeccompDir);
 }
 

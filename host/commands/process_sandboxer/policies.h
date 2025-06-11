@@ -31,18 +31,18 @@ namespace cuttlefish::process_sandboxer {
 struct HostInfo {
   absl::Status EnsureOutputDirectoriesExist();
   std::string HostToolExe(std::string_view exe) const;
+  std::string EnvironmentsUdsDir() const;
+  std::string InstanceUdsDir() const;
+  std::string VsockDeviceDir() const;
 
   std::string assembly_dir;
   std::string cuttlefish_config_path;
-  std::string early_tmp_dir;
   std::string environments_dir;
-  std::string environments_uds_dir;
   std::string guest_image_path;
   std::string host_artifacts_path;
-  std::string instance_uds_dir;
   std::string log_dir;
   std::string runtime_dir;
-  std::string vsock_device_dir;
+  std::string tmp_dir;
 };
 
 std::ostream& operator<<(std::ostream&, const HostInfo&);
@@ -53,6 +53,7 @@ sandbox2::PolicyBuilder AdbConnectorPolicy(const HostInfo&);
 sandbox2::PolicyBuilder AssembleCvdPolicy(const HostInfo&);
 sandbox2::PolicyBuilder AvbToolPolicy(const HostInfo&);
 sandbox2::PolicyBuilder CasimirPolicy(const HostInfo&);
+sandbox2::PolicyBuilder CfVhostUserInput(const HostInfo&);
 sandbox2::PolicyBuilder CasimirControlServerPolicy(const HostInfo&);
 sandbox2::PolicyBuilder ControlEnvProxyServerPolicy(const HostInfo&);
 sandbox2::PolicyBuilder CvdInternalStartPolicy(const HostInfo&);

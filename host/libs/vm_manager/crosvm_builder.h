@@ -42,6 +42,9 @@ class CrosvmBuilder {
   void AddHvcSink();
   void AddHvcReadOnly(const std::string& output, bool console = false);
   void AddHvcReadWrite(const std::string& output, const std::string& input);
+  void AddHvcSocket(const std::string& socket);
+
+  void AddKvmPath(const std::string& path);
 
   void AddReadOnlyDisk(const std::string& path);
   void AddReadWriteDisk(const std::string& path);
@@ -58,6 +61,15 @@ class CrosvmBuilder {
               std::optional<std::string_view> mac = std::nullopt,
               const std::optional<pci::Address>& pci = std::nullopt);
 #endif
+  // Adds a vhost-user device to the crosvm command.
+  // The max_queue_size parameter represents the maximum number of buffers the
+  // virtqueues can hold at a given time and must be a power of 2. It must be
+  // large enough to avoid dropping buffers during peak usage but not so large
+  // that it consumes excesive amounts of guest RAM. Most sources recommend a
+  // value between 256 and 1024, suggesting to start with 256 when in doubt and
+  // increase as needed for performance.
+  void AddVhostUser(const std::string& type, const std::string& socket_path,
+                    int max_queue_size = 256);
 
   int HvcNum();
 

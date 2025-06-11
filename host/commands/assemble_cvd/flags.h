@@ -30,6 +30,7 @@ namespace cuttlefish {
 
 struct GuestConfig {
   Arch target_arch;
+  DeviceType device_type;
   bool bootconfig_supported = false;
   bool hctr2_supported = false;
   std::string android_version_number;
@@ -39,6 +40,10 @@ struct GuestConfig {
   bool supports_bgra_framebuffers = false;
   bool prefer_drm_virgl_when_supported = false;
   bool mouse_supported = false;
+  std::string ti50_emulator;
+  std::optional<std::string> custom_keyboard_config;
+  std::optional<std::string> domkey_mapping_config;
+  int output_audio_streams_count = 1;
 };
 
 Result<std::vector<GuestConfig>> GetGuestConfigAndSetDefaults();
